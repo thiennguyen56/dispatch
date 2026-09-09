@@ -12,19 +12,19 @@ const (
 )
 
 type Delivery struct {
-	ID             string
-	URL            string
-	Payload        string
-	Headers        map[string]string
-	Status         DeliveryStatus
-	AttemptsMade   int
-	MaxAttempts    int
-	NextAttemptAt  time.Time
-	LeaseToken     *string
-	LeaseExpiresAt *time.Time
-	LastError      *string
-	IdempotencyKey *string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	DeliveredAt    *time.Time
+	ID             string            `json:"id"`
+	URL            string            `json:"url"`
+	Payload        string            `json:"payload"`
+	Headers        map[string]string `json:"headers"`
+	Status         DeliveryStatus    `json:"status"`
+	AttemptsMade   int               `json:"attempts_made"`
+	MaxAttempts    int               `json:"max_attempts"`
+	NextAttemptAt  time.Time         `json:"next_attempt_at"`
+	LeaseToken     *string           `json:"lease_token"`
+	LeaseExpiresAt *time.Time        `json:"lease_expires_at"`
+	LastError      *string           `json:"last_error"`
+	IdempotencyKey *string           `json:"idempotency_key"`
+	CreatedAt      time.Time         `json:"created_at"`
+	UpdatedAt      time.Time         `json:"updated_at"`
+	DeliveredAt    *time.Time        `json:"delivered_at"`
 }

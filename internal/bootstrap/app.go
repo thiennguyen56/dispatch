@@ -1,13 +1,17 @@
 package bootstrap
 
 import (
+	"database/sql"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/thiennguyen56/dispatch/internal/adapters/inbound/httpapi"
+	"github.com/thiennguyen56/dispatch/internal/adapters/outbound/sqlite"
 	"github.com/thiennguyen56/dispatch/internal/application"
 	"github.com/thiennguyen56/dispatch/pkg/logger"
+
+	_ "modernc.org/sqlite" // Import the driver anonymously
 )
 
 type App struct {
@@ -23,7 +27,14 @@ func (a *App) Run() error {
 		Level:   slog.LevelInfo,
 		JSON:    true,
 	})
-	service := application.NewService(log)
+
+	db, err := sql.Open("sqlite", "dispatch.db")
+	if err != nil {
+		log.Error("failed to open database", "error", err)
+		return err
+	}
+	repo := sqlite.NewRepository(db, log)
+	service := application.NewService(log, repo)
 	router := httpapi.NewRouter(log, service)
 	srv := &http.Server{
 		Handler:      router.DeliveryRouter(),

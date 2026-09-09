@@ -1,17 +1,23 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+
+	"github.com/gorilla/mux"
+	"github.com/thiennguyen56/dispatch/internal/application"
+	"github.com/thiennguyen56/dispatch/internal/domain"
 )
 
 type Service interface {
-
+	Submit(ctx context.Context, input application.InputSubmit) (*domain.Delivery, error)
+	Get(ctx context.Context, id string) (*domain.Delivery, error)
 }
 
 type Handler struct {
-	logger *slog.Logger
+	logger  *slog.Logger
 	service Service
 }
 
@@ -32,8 +38,35 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.logger.Info("submit deliveries", "input", input)
-
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"message": "Hello World!",
+	deliveryRow, err := h.service.Submit(r.Context(), application.InputSubmit{
+		URL:     input.URL,
+		Payload: input.Payload,
+		Headers: input.Headers,
 	})
+	if err != nil {
+		h.logger.Error("failed to submit deliveries", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":      deliveryRow.ID,
+		"message": "Submitted deliveries",
+	})
+}
+
+func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "id query parameter is required")
+		return
+	}
+
+	delivery, err := h.service.Get(r.Context(), id)
+	if err != nil {
+		h.logger.Error("failed to get delivery", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, delivery)
 }

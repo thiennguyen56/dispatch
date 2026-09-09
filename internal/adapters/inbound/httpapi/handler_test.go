@@ -2,13 +2,29 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/thiennguyen56/dispatch/internal/application"
+	"github.com/thiennguyen56/dispatch/internal/domain"
 )
+
+type serviceStub struct {
+	delivery *domain.Delivery
+}
+
+func (s serviceStub) Submit(context.Context, application.InputSubmit) (*domain.Delivery, error) {
+	return s.delivery, nil
+}
+
+func (s serviceStub) Get(context.Context, string) (*domain.Delivery, error) {
+	return s.delivery, nil
+}
 
 func TestHandlerSubmitReturnsStandardErrorResponse(t *testing.T) {
 	t.Parallel()
@@ -63,7 +79,9 @@ func TestHandlerSubmitReturnsStandardErrorResponse(t *testing.T) {
 func TestHandlerSubmitSuccessUsesJSONResponse(t *testing.T) {
 	t.Parallel()
 
-	handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{
+		delivery: &domain.Delivery{ID: "delivery-1"},
+	})
 	req := httptest.NewRequest(http.MethodPost, "/deliveries", bytes.NewBufferString(`{"url":"https://example.com"}`))
 	response := httptest.NewRecorder()
 
@@ -80,7 +98,10 @@ func TestHandlerSubmitSuccessUsesJSONResponse(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if got, want := body["message"], "Hello World!"; got != want {
+	if got, want := body["message"], "Submitted deliveries"; got != want {
 		t.Errorf("message = %q, want %q", got, want)
+	}
+	if got, want := body["id"], "delivery-1"; got != want {
+		t.Errorf("id = %q, want %q", got, want)
 	}
 }
