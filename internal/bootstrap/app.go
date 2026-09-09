@@ -4,21 +4,22 @@ import (
 	"database/sql"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/thiennguyen56/dispatch/internal/adapters/inbound/httpapi"
 	"github.com/thiennguyen56/dispatch/internal/adapters/outbound/sqlite"
 	"github.com/thiennguyen56/dispatch/internal/application"
+	"github.com/thiennguyen56/dispatch/internal/config"
 	"github.com/thiennguyen56/dispatch/pkg/logger"
 
 	_ "modernc.org/sqlite" // Import the driver anonymously
 )
 
 type App struct {
+	config config.Config
 }
 
-func NewApp() *App {
-	return &App{}
+func NewApp(appConfig config.Config) *App {
+	return &App{config: appConfig}
 }
 
 func (a *App) Run() error {
@@ -38,9 +39,9 @@ func (a *App) Run() error {
 	router := httpapi.NewRouter(log, service)
 	srv := &http.Server{
 		Handler:      router.DeliveryRouter(),
-		Addr:         ":8080",
-		WriteTimeout: 15 * time.Second,
-		ReadTimeout:  15 & time.Second,
+		Addr:         a.config.Server.Address,
+		WriteTimeout: a.config.Server.WriteTimeout,
+		ReadTimeout:  a.config.Server.ReadTimeout,
 	}
 
 	log.Info("server started", "addr", srv.Addr)
