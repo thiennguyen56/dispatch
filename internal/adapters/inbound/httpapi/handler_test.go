@@ -4,26 +4,106 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/gorilla/mux"
 	"github.com/thiennguyen56/dispatch/internal/application"
 	"github.com/thiennguyen56/dispatch/internal/domain"
 )
 
 type serviceStub struct {
-	delivery *domain.Delivery
+	delivery  *domain.Delivery
+	submitErr error
+	getErr    error
 }
 
 func (s serviceStub) Submit(context.Context, application.InputSubmit) (*domain.Delivery, error) {
-	return s.delivery, nil
+	return s.delivery, s.submitErr
 }
 
 func (s serviceStub) Get(context.Context, string) (*domain.Delivery, error) {
-	return s.delivery, nil
+	return s.delivery, s.getErr
+}
+
+func TestHandlerSubmitServiceErrorReturnsStandardErrorResponse(t *testing.T) {
+	t.Parallel()
+
+	handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{
+		submitErr: errors.New("database unavailable"),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/deliveries", bytes.NewBufferString(`{"url":"https://example.com"}`))
+	response := httptest.NewRecorder()
+
+	handler.Submit(response, req)
+
+	assertErrorResponse(t, response, http.StatusInternalServerError, "internal_error", "database unavailable")
+}
+
+func TestHandlerGet(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns delivery", func(t *testing.T) {
+		handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{
+			delivery: &domain.Delivery{ID: "delivery-1", Status: domain.DeliveryStatusPending},
+		})
+		req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/deliveries/delivery-1", nil), map[string]string{"id": "delivery-1"})
+		response := httptest.NewRecorder()
+
+		handler.Get(response, req)
+
+		if got, want := response.Code, http.StatusOK; got != want {
+			t.Fatalf("status = %d, want %d", got, want)
+		}
+		var delivery domain.Delivery
+		if err := json.NewDecoder(response.Body).Decode(&delivery); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if got, want := delivery.ID, "delivery-1"; got != want {
+			t.Errorf("ID = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("rejects missing ID", func(t *testing.T) {
+		handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		response := httptest.NewRecorder()
+
+		handler.Get(response, httptest.NewRequest(http.MethodGet, "/deliveries/", nil))
+
+		assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request", "id query parameter is required")
+	})
+
+	t.Run("returns service error", func(t *testing.T) {
+		handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{getErr: errors.New("not found")})
+		req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/deliveries/missing", nil), map[string]string{"id": "missing"})
+		response := httptest.NewRecorder()
+
+		handler.Get(response, req)
+
+		assertErrorResponse(t, response, http.StatusInternalServerError, "internal_error", "not found")
+	})
+}
+
+func assertErrorResponse(t *testing.T, response *httptest.ResponseRecorder, wantStatus int, wantCode, wantMessage string) {
+	t.Helper()
+
+	if got := response.Code; got != wantStatus {
+		t.Fatalf("status = %d, want %d", got, wantStatus)
+	}
+	var body errorResponse
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := body.Error.Code; got != wantCode {
+		t.Errorf("error code = %q, want %q", got, wantCode)
+	}
+	if got := body.Error.Message; got != wantMessage {
+		t.Errorf("error message = %q, want %q", got, wantMessage)
+	}
 }
 
 func TestHandlerSubmitReturnsStandardErrorResponse(t *testing.T) {

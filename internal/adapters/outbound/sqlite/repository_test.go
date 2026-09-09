@@ -3,9 +3,11 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -17,16 +19,27 @@ func TestRepositoryGetRoundTripsHeaders(t *testing.T) {
 	db := openTestDB(t)
 	repository := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	now := time.Date(2026, time.September, 9, 12, 0, 0, 0, time.UTC)
+	leaseToken := "lease-1"
+	lastError := "temporary failure"
+	idempotencyKey := "request-1"
+	leaseExpiresAt := now.Add(time.Minute)
+	deliveredAt := now.Add(2 * time.Minute)
 	delivery := domain.Delivery{
-		ID:            "delivery-1",
-		URL:           "https://example.com/webhooks",
-		Payload:       `{"event":"delivery.created"}`,
-		Headers:       map[string]string{"Authorization": "Bearer <REDACTED>"},
-		Status:        domain.DeliveryStatusPending,
-		MaxAttempts:   8,
-		NextAttemptAt: now,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:             "delivery-1",
+		URL:            "https://example.com/webhooks",
+		Payload:        `{"event":"delivery.created"}`,
+		Headers:        map[string]string{"Authorization": "Bearer <REDACTED>"},
+		Status:         domain.DeliveryStatusDelivered,
+		AttemptsMade:   2,
+		MaxAttempts:    8,
+		NextAttemptAt:  now,
+		LeaseToken:     &leaseToken,
+		LeaseExpiresAt: &leaseExpiresAt,
+		LastError:      &lastError,
+		IdempotencyKey: &idempotencyKey,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		DeliveredAt:    &deliveredAt,
 	}
 
 	if err := repository.Create(context.Background(), delivery); err != nil {
@@ -37,8 +50,13 @@ func TestRepositoryGetRoundTripsHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
-	if got.Headers["Authorization"] != delivery.Headers["Authorization"] {
-		t.Errorf("headers = %#v, want %#v", got.Headers, delivery.Headers)
+	if !reflect.DeepEqual(got, &delivery) {
+		t.Errorf("Get() = %#v, want %#v", got, &delivery)
+	}
+
+	_, err = repository.Get(context.Background(), "missing")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("Get(missing) error = %v, want %v", err, sql.ErrNoRows)
 	}
 }
 
