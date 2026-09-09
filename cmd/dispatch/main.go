@@ -1,7 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"github.com/thiennguyen56/dispatch/internal/bootstrap"
+)
 
 func main() {
-	fmt.Println("Hello world!")
+	bootstrap.NewApp().Run()
 }

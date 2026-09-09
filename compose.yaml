@@ -1,0 +1,16 @@
+services:
+  dispatch:
+    build:
+      context: .
+    ports:
+      - "8080:8080"
+    environment:
+      # Wire this into the Go bootstrap when the SQLite connection is added.
+      DISPATCH_DB_PATH: /var/lib/dispatch/dispatch.db
+    volumes:
+      - dispatch-sqlite:/var/lib/dispatch
+
+volumes:
+  # SQLite is an embedded database, so a persistent filesystem volume replaces
+  # a separate database-server container.
+  dispatch-sqlite:

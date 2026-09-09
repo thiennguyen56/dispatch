@@ -1,0 +1,9 @@
+.git
+.gitignore
+.dockerignore
+README.md
+tmp/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
