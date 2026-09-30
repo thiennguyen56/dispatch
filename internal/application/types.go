@@ -13,6 +13,16 @@ type InputSubmit struct {
 	Headers map[string]string `json:"headers"`
 }
 
+// SendResult describes one outbound attempt without assigning persistence IDs
+// or deciding whether the delivery should be retried.
+type SendResult struct {
+	StartedAt      time.Time
+	FinishedAt     time.Time
+	Duration       time.Duration
+	Outcome        domain.AttemptOutcome
+	ResponseStatus *int
+}
+
 type FinalizeAttemptInput struct {
 	DeliveryID string
 	LeaseToken string
@@ -21,8 +31,6 @@ type FinalizeAttemptInput struct {
 	ErrorMessage *string
 	RetryAt      *time.Time
 }
-
-var ErrLeaseLost = errors.New("delivery lease is no longer owned")
 
 func (input FinalizeAttemptInput) Validate() error {
 	if input.DeliveryID == "" || input.LeaseToken == "" {
