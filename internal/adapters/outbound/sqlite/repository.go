@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/thiennguyen56/dispatch/internal/application"
 	"github.com/thiennguyen56/dispatch/internal/domain"
 )
 
@@ -130,8 +133,50 @@ func (row deliveryRow) toDomain() (*domain.Delivery, error) {
 	}, nil
 }
 
+func (r *Repository) ClaimNext(ctx context.Context, now time.Time, leaseDuration time.Duration) (*domain.Delivery, error) {
+	var delRow deliveryRow
+	row := r.db.QueryRowContext(
+		ctx,
+		claimNextDelivery,
+		sql.Named("now", formatTime(now)),
+		sql.Named("lease_token", uuid.NewString()),
+		sql.Named("lease_expires_at", formatTime(now.Add(leaseDuration))),
+	)
+
+	err := row.Scan(
+		&delRow.ID,
+		&delRow.URL,
+		&delRow.Payload,
+		&delRow.HeadersJSON,
+		&delRow.Status,
+		&delRow.AttemptsMade,
+		&delRow.MaxAttempts,
+		&delRow.NextAttemptAt,
+		&delRow.LeaseToken,
+		&delRow.LeaseExpiresAt,
+		&delRow.LastError,
+		&delRow.IdempotencyKey,
+		&delRow.CreatedAt,
+		&delRow.UpdatedAt,
+		&delRow.DeliveredAt,
+	)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, application.ErrNoJob{}
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("claim next delivery: %w", err)
+	}
+
+	return delRow.toDomain()
+}
+
+// Fixed-width UTC timestamps preserve chronological order in SQLite TEXT comparisons.
+const dbTimeLayout = "2006-01-02T15:04:05.000000000Z"
+
 func formatTime(value time.Time) string {
-	return value.UTC().Format(time.RFC3339Nano)
+	return value.UTC().Format(dbTimeLayout)
 }
 
 func formatOptionalTime(value *time.Time) any {

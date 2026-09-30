@@ -29,6 +29,10 @@ func (r *repositoryStub) Get(context.Context, string) (*domain.Delivery, error) 
 	return r.getDelivery, r.getErr
 }
 
+func (r *repositoryStub) ClaimNext(_ context.Context, _ time.Time, _ time.Duration) (*domain.Delivery, error) {
+	return nil, nil
+}
+
 func TestNewDelivery(t *testing.T) {
 	t.Parallel()
 

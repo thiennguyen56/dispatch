@@ -68,14 +68,20 @@ func openTestDB(t *testing.T) *sql.DB {
 		t.Fatalf("open database: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(1)
 
-	migration, err := os.ReadFile("migration/001_init.up.sql")
+	applyTestMigration(t, db, "001_init.up.sql")
+	applyTestMigration(t, db, "002_normalize_timestamps.up.sql")
+	return db
+}
+
+func applyTestMigration(t *testing.T, db *sql.DB, name string) {
+	t.Helper()
+	migration, err := os.ReadFile("migration/" + name)
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
 	}
 	if _, err := db.Exec(string(migration)); err != nil {
 		t.Fatalf("apply migration: %v", err)
 	}
-
-	return db
 }

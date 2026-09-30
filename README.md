@@ -2,7 +2,7 @@
 
 Dispatch is a Go HTTP service that accepts webhook delivery requests, stores
 them in SQLite, and retrieves them by ID. It currently persists deliveries; a
-background sender and retry worker have not been implemented yet.
+background delivery processing and retries are not wired into the application yet.
 
 ## Requirements
 
@@ -90,6 +90,13 @@ connecting to a separate database service. The initial schema defines:
 
 Migration files are in `internal/adapters/outbound/sqlite/migration/`.
 
+Database timestamps use UTC with exactly nine fractional digits so text
+comparisons match chronological order. Migration `002` normalizes existing
+UTC timestamps without changing their precision or optional `NULL` values.
+Stop older application instances before applying it and restart with the
+updated code so they cannot write variable-width timestamps again. Its down
+migration retains normalized values, which the older reader also accepts.
+
 ```bash
 make migrate-up
 make migrate-version
@@ -112,6 +119,16 @@ yet wired together**. Run locally with the migration commands above until the
 database-path configuration is implemented.
 
 ## Development
+
+The outbound HTTP sender performs one POST per call using the stored payload
+and headers. Content-Type defaults to `application/json` when absent. It has a
+10-second timeout, honors context cancellation, and does not follow redirects.
+Only 2xx responses produce a successful outcome. Non-2xx responses return a
+failed result with their status; request/transport failures also return an
+error, with timeouts distinguished from other failures. The processor must
+inspect the outcome even when the error is nil. Response bodies are discarded
+with a 64 KiB drain limit. Retry scheduling and attempt persistence belong to
+the processor and are not implemented by the sender.
 
 ```bash
 go test ./...
