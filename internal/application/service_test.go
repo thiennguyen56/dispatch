@@ -33,6 +33,14 @@ func (r *repositoryStub) ClaimNext(_ context.Context, _ time.Time, _ time.Durati
 	return nil, nil
 }
 
+func (r *repositoryStub) FinalizeAttempt(
+	_ context.Context,
+	_ FinalizeAttemptInput,
+	_ time.Time,
+) error {
+	return nil
+}
+
 func TestNewDelivery(t *testing.T) {
 	t.Parallel()
 

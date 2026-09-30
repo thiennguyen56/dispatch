@@ -88,3 +88,66 @@ RETURNING
     updated_at,
     delivered_at;
 `
+
+const finalizeDelivery = `
+UPDATE deliveries
+SET
+    attempts_made = attempts_made + 1,
+
+    status = CASE
+        WHEN :outcome = 'succeeded' THEN 'delivered'
+        WHEN :retry_at IS NOT NULL
+             AND attempts_made + 1 < max_attempts THEN 'pending'
+        ELSE 'dead_letter'
+    END,
+
+    next_attempt_at = CASE
+        WHEN :outcome != 'succeeded'
+             AND :retry_at IS NOT NULL
+             AND attempts_made + 1 < max_attempts THEN :retry_at
+        ELSE next_attempt_at
+    END,
+
+    delivered_at = CASE
+        WHEN :outcome = 'succeeded' THEN :finished_at
+        ELSE NULL
+    END,
+
+    last_error = CASE
+        WHEN :outcome = 'succeeded' THEN NULL
+        ELSE :error_message
+    END,
+
+    lease_token = NULL,
+    lease_expires_at = NULL,
+    updated_at = :now
+
+WHERE id = :delivery_id
+  AND status = 'in_progress'
+  AND lease_token = :lease_token
+  AND attempts_made < max_attempts
+
+RETURNING attempts_made
+`
+
+const insertCompletedAttempt = `
+INSERT INTO delivery_attempts (
+    delivery_id,
+    attempt_number,
+    started_at,
+    finished_at,
+    outcome,
+    response_status,
+    error_message,
+    duration_ms
+) VALUES (
+    :delivery_id,
+    :attempt_number,
+    :started_at,
+    :finished_at,
+    :outcome,
+    :response_status,
+    :error_message,
+    :duration_ms
+)
+`

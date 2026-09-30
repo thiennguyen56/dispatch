@@ -172,6 +172,67 @@ func (r *Repository) ClaimNext(ctx context.Context, now time.Time, leaseDuration
 	return delRow.toDomain()
 }
 
+func (r *Repository) FinalizeAttempt(
+	ctx context.Context,
+	input application.FinalizeAttemptInput,
+	now time.Time,
+) error {
+	if err := input.Validate(); err != nil {
+		return fmt.Errorf("validate finalization: %w", err)
+	}
+	if now.IsZero() || now.Before(input.Result.FinishedAt) {
+		return errors.New("finalization time must not precede attempt completion")
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin finalization: %w", err)
+	}
+	defer tx.Rollback()
+
+	var attemptNumber int
+	err = tx.QueryRowContext(
+		ctx,
+		finalizeDelivery,
+		sql.Named("delivery_id", input.DeliveryID),
+		sql.Named("lease_token", input.LeaseToken),
+		sql.Named("outcome", string(input.Result.Outcome)),
+		sql.Named("retry_at", formatOptionalTime(input.RetryAt)),
+		sql.Named("finished_at", formatTime(input.Result.FinishedAt)),
+		sql.Named("error_message", input.ErrorMessage),
+		sql.Named("now", formatTime(now)),
+	).Scan(&attemptNumber)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return application.ErrLeaseLost
+	}
+	if err != nil {
+		return fmt.Errorf("update delivery during finalization: %w", err)
+	}
+
+	_, err = tx.ExecContext(
+		ctx,
+		insertCompletedAttempt,
+		sql.Named("delivery_id", input.DeliveryID),
+		sql.Named("attempt_number", attemptNumber),
+		sql.Named("started_at", formatTime(input.Result.StartedAt)),
+		sql.Named("finished_at", formatTime(input.Result.FinishedAt)),
+		sql.Named("outcome", string(input.Result.Outcome)),
+		sql.Named("response_status", input.Result.ResponseStatus),
+		sql.Named("error_message", input.ErrorMessage),
+		sql.Named("duration_ms", input.Result.Duration.Milliseconds()),
+	)
+	if err != nil {
+		return fmt.Errorf("insert completed attempt: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit finalization: %w", err)
+	}
+
+	return nil
+}
+
 // Fixed-width UTC timestamps preserve chronological order in SQLite TEXT comparisons.
 const dbTimeLayout = "2006-01-02T15:04:05.000000000Z"
 
