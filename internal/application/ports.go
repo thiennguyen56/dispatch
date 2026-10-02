@@ -20,9 +20,5 @@ type DeliveryRepository interface {
 }
 
 type Sender interface {
-	// Send performs one outbound attempt. A nil error means an HTTP response
-	// was received; callers must inspect Outcome, including for non-2xx replies.
-	// Errors describe request/transport failures; the result still includes timing
-	// and an outcome, with no response status when no response was received.
 	Send(ctx context.Context, delivery domain.Delivery) (SendResult, error)
 }

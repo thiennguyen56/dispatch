@@ -9,7 +9,7 @@ import (
 	"github.com/thiennguyen56/dispatch/internal/application"
 )
 
-type Service interface {
+type Processor interface {
 	ProcessNext(ctx context.Context) error
 }
 
@@ -22,14 +22,14 @@ func NewPool() *Pool {
 
 type Worker struct {
 	logger       *slog.Logger
-	service      Service
+	processor    Processor
 	pollInterval time.Duration
 }
 
-func NewWorker(logger *slog.Logger, service Service, pollInterval time.Duration) *Worker {
+func NewWorker(logger *slog.Logger, processor Processor, pollInterval time.Duration) *Worker {
 	return &Worker{
 		logger:       logger,
-		service:      service,
+		processor:    processor,
 		pollInterval: pollInterval,
 	}
 }
@@ -40,7 +40,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			return err
 		}
 
-		err := w.service.ProcessNext(ctx)
+		err := w.processor.ProcessNext(ctx)
 
 		if err == nil {
 			continue // Immediately try the next job.
@@ -50,6 +50,8 @@ func (w *Worker) Run(ctx context.Context) error {
 			w.logger.ErrorContext(ctx, "processing failed",
 				"error", err,
 			)
+		} else {
+			w.logger.InfoContext(ctx, "no job to process")
 		}
 
 		// Pause when idle or after an infrastructure error.
