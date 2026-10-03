@@ -8,9 +8,10 @@ import (
 )
 
 type InputSubmit struct {
-	URL     string            `json:"url"`
-	Payload string            `json:"payload"`
-	Headers map[string]string `json:"headers"`
+	URL            string            `json:"url"`
+	Payload        string            `json:"payload"`
+	Headers        map[string]string `json:"headers"`
+	IdempotencyKey *string           `json:"idempotency_key"`
 }
 
 // SendResult describes one outbound attempt without assigning persistence IDs

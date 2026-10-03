@@ -69,6 +69,8 @@ func (s *Sender) Send(ctx context.Context, delivery domain.Delivery) (result app
 	for name, value := range delivery.Headers {
 		req.Header.Set(name, value)
 	}
+
+	req.Header.Set("X-Dispatch-Delivery-ID", delivery.ID)
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -77,7 +79,9 @@ func (s *Sender) Send(ctx context.Context, delivery domain.Delivery) (result app
 	if err != nil {
 		return result, fmt.Errorf("send webhook request: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	status := response.StatusCode
 	result.ResponseStatus = &status
 	if status >= http.StatusOK && status < http.StatusMultipleChoices {

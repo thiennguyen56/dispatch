@@ -37,11 +37,16 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var idempotencyKey *string
+	if key := r.Header.Get("Idempotency-Key"); key != "" {
+		idempotencyKey = &key
+	}
 	h.logger.Info("submit deliveries", "input", input)
 	deliveryRow, err := h.service.Submit(r.Context(), application.InputSubmit{
-		URL:     input.URL,
-		Payload: input.Payload,
-		Headers: input.Headers,
+		URL:            input.URL,
+		Payload:        input.Payload,
+		Headers:        input.Headers,
+		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
 		h.logger.Error("failed to submit deliveries", "error", err)

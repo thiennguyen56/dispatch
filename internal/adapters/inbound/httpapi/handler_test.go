@@ -20,10 +20,50 @@ type serviceStub struct {
 	delivery  *domain.Delivery
 	submitErr error
 	getErr    error
+	submit    func(context.Context, application.InputSubmit) (*domain.Delivery, error)
 }
 
-func (s serviceStub) Submit(context.Context, application.InputSubmit) (*domain.Delivery, error) {
+func (s serviceStub) Submit(ctx context.Context, input application.InputSubmit) (*domain.Delivery, error) {
+	if s.submit != nil {
+		return s.submit(ctx, input)
+	}
 	return s.delivery, s.submitErr
+}
+
+func TestHandlerSubmitIdempotencyHeader(t *testing.T) {
+	for _, key := range []string{"", "order-123"} {
+		t.Run("key="+key, func(t *testing.T) {
+			var captured application.InputSubmit
+			handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{
+				submit: func(_ context.Context, input application.InputSubmit) (*domain.Delivery, error) {
+					captured = input
+					return &domain.Delivery{ID: "original"}, nil
+				},
+			})
+			req := httptest.NewRequest(http.MethodPost, "/deliveries", bytes.NewBufferString(`{"url":"https://example.com"}`))
+			if key != "" {
+				req.Header.Set("Idempotency-Key", key)
+			}
+			response := httptest.NewRecorder()
+			handler.Submit(response, req)
+			if response.Code != http.StatusCreated {
+				t.Fatalf("status = %d", response.Code)
+			}
+			if key == "" {
+				if captured.IdempotencyKey != nil {
+					t.Errorf("absent header became key %v", captured.IdempotencyKey)
+				}
+			} else if captured.IdempotencyKey == nil || *captured.IdempotencyKey != key {
+				t.Errorf("header was not forwarded: %v", captured.IdempotencyKey)
+			}
+			var body struct {
+				ID string `json:"id"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&body); err != nil || body.ID != "original" {
+				t.Errorf("original ID not returned: %+v, %v", body, err)
+			}
+		})
+	}
 }
 
 func (s serviceStub) Get(context.Context, string) (*domain.Delivery, error) {

@@ -2,7 +2,9 @@ package application
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -18,11 +20,21 @@ type repositoryStub struct {
 	createErr   error
 	getDelivery *domain.Delivery
 	getErr      error
+	createCalls int
+	lookup      func(context.Context, string) (*domain.Delivery, error)
 }
 
 func (r *repositoryStub) Create(_ context.Context, delivery domain.Delivery) error {
+	r.createCalls++
 	r.created = delivery
 	return r.createErr
+}
+
+func (r *repositoryStub) GetByIdempotencyKey(ctx context.Context, key string) (*domain.Delivery, error) {
+	if r.lookup != nil {
+		return r.lookup(ctx, key)
+	}
+	return nil, sql.ErrNoRows
 }
 
 func (r *repositoryStub) Get(context.Context, string) (*domain.Delivery, error) {
@@ -64,6 +76,9 @@ func TestNewDelivery(t *testing.T) {
 	}
 	if !maps.Equal(got.Headers, input.Headers) {
 		t.Errorf("headers = %#v, want %#v", got.Headers, input.Headers)
+	}
+	if got.IdempotencyKey != nil {
+		t.Errorf("absent idempotency key = %v, want nil", got.IdempotencyKey)
 	}
 
 	input.Headers["X-Request-ID"] = "changed"
@@ -136,4 +151,91 @@ func TestServiceGet(t *testing.T) {
 			t.Errorf("Get() = %#v, want nil", got)
 		}
 	})
+}
+
+func TestServiceSubmitIdempotency(t *testing.T) {
+	t.Parallel()
+	key := "order-123"
+	existing := &domain.Delivery{ID: "original", URL: "https://original.example", IdempotencyKey: &key}
+	lookupFailure := errors.New("lookup unavailable")
+	cases := []struct {
+		name        string
+		lookup      func(context.Context, string) (*domain.Delivery, error)
+		createErr   error
+		wantErr     error
+		wantCreates int
+		wantOld     bool
+	}{
+		{
+			name: "existing key ignores replacement content",
+			lookup: func(context.Context, string) (*domain.Delivery, error) {
+				return existing, nil
+			},
+			wantOld: true,
+		},
+		{name: "new key creates delivery", wantCreates: 1},
+		{
+			name: "lookup error does not insert",
+			lookup: func(context.Context, string) (*domain.Delivery, error) {
+				return nil, lookupFailure
+			},
+			wantErr: lookupFailure,
+		},
+		{
+			name: "concurrent insert conflict returns winner",
+			lookup: func() func(context.Context, string) (*domain.Delivery, error) {
+				calls := 0
+				return func(context.Context, string) (*domain.Delivery, error) {
+					calls++
+					if calls == 1 {
+						return nil, fmt.Errorf("lookup: %w", sql.ErrNoRows)
+					}
+					return existing, nil
+				}
+			}(),
+			createErr: fmt.Errorf("insert: %w", ErrIdempotencyKeyExists), wantCreates: 1, wantOld: true,
+		},
+		{
+			name: "conflict lookup error propagates",
+			lookup: func() func(context.Context, string) (*domain.Delivery, error) {
+				calls := 0
+				return func(context.Context, string) (*domain.Delivery, error) {
+					calls++
+					if calls == 1 {
+						return nil, sql.ErrNoRows
+					}
+					return nil, lookupFailure
+				}
+			}(),
+			createErr: ErrIdempotencyKeyExists, wantCreates: 1, wantErr: lookupFailure,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &repositoryStub{lookup: tc.lookup, createErr: tc.createErr}
+			service := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)), repo)
+			got, err := service.Submit(context.Background(), InputSubmit{
+				URL: "https://replacement.example", Payload: "changed", IdempotencyKey: &key,
+			})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Submit() error = %v, want %v", err, tc.wantErr)
+			}
+			if repo.createCalls != tc.wantCreates {
+				t.Errorf("Create calls = %d, want %d", repo.createCalls, tc.wantCreates)
+			}
+			if tc.wantErr != nil {
+				if got != nil {
+					t.Errorf("failed submission returned %+v", got)
+				}
+				return
+			}
+			if tc.wantOld {
+				if got != existing {
+					t.Errorf("Submit returned %+v, want original %+v", got, existing)
+				}
+			} else if got == nil || got.IdempotencyKey == nil || *got.IdempotencyKey != key || got.ID != repo.created.ID {
+				t.Errorf("new submission did not preserve key/ID: %+v", got)
+			}
+		})
+	}
 }

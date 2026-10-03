@@ -17,7 +17,11 @@ INSERT INTO deliveries (
     created_at,
     updated_at,
     delivered_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (idempotency_key)
+WHERE idempotency_key IS NOT NULL
+DO NOTHING
+`
 
 const getDelivery = `
 SELECT
@@ -38,6 +42,27 @@ SELECT
     delivered_at
 FROM deliveries
 WHERE id = ?
+`
+
+const getDeliveryByIdempotencyKey = `
+SELECT
+    id,
+    target_url,
+    payload,
+    headers_json,
+    status,
+    attempts_made,
+    max_attempts,
+    next_attempt_at,
+    lease_token,
+    lease_expires_at,
+    last_error,
+    idempotency_key,
+    created_at,
+    updated_at,
+    delivered_at
+FROM deliveries
+WHERE idempotency_key = ?
 `
 
 const claimNextDelivery = `

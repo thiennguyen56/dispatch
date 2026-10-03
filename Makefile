@@ -5,7 +5,7 @@ DB_PATH ?= dispatch.db
 MIGRATIONS_DIR := internal/adapters/outbound/sqlite/migration
 DATABASE_URL := sqlite://$(abspath $(DB_PATH))
 
-.PHONY: migrate-up migrate-down migrate-version migrate-create check-migrate
+.PHONY: migrate-up migrate-down migrate-version migrate-create check-migrate go-test go-dev go-lint
 
 check-migrate:
 	@test -x "$(MIGRATE)" || { \
@@ -27,3 +27,12 @@ migrate-version: check-migrate
 migrate-create: check-migrate
 	@test -n "$(name)" || { echo "usage: make migrate-create name=create_attempt_index"; exit 1; }
 	$(MIGRATE) create -ext sql -dir $(MIGRATIONS_DIR) -seq -digits 3 "$(name)"
+
+go-test:
+	go test -v ./...
+
+go-dev:
+	go run ./cmd/dispatch/main.go
+
+go-lint:
+	golangci-lint run

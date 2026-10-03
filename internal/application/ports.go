@@ -10,6 +10,7 @@ import (
 type DeliveryRepository interface {
 	Create(ctx context.Context, delivery domain.Delivery) error
 	Get(ctx context.Context, id string) (*domain.Delivery, error)
+	GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.Delivery, error)
 	ClaimNext(ctx context.Context, now time.Time, leaseDuration time.Duration) (*domain.Delivery, error)
 
 	FinalizeAttempt(

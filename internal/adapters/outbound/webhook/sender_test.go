@@ -20,6 +20,34 @@ func testSender() *Sender {
 	return NewSender(slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
+func TestSendUsesStableDeliveryIDAcrossAttempts(t *testing.T) {
+	sender := testSender()
+	var calls int
+	sender.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if got := req.Header.Get("X-Dispatch-Delivery-ID"); got != "delivery-123" {
+			t.Errorf("delivery header = %q", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusNoContent, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader("")),
+		}, nil
+	})
+	delivery := domain.Delivery{
+		ID: "delivery-123", URL: "https://example.com",
+		Headers: map[string]string{"x-dispatch-delivery-id": "client-override"},
+	}
+	for range 2 {
+		if _, err := sender.Send(context.Background(), delivery); err != nil {
+			t.Fatal(err)
+		}
+		delivery.AttemptsMade++
+	}
+	if calls != 2 || delivery.Headers["x-dispatch-delivery-id"] != "client-override" {
+		t.Errorf("attempt count or original headers changed: calls=%d, headers=%v", calls, delivery.Headers)
+	}
+}
+
 func TestSendPreservesRequest(t *testing.T) {
 	for _, contentType := range []string{"", "text/plain"} {
 		t.Run(fmt.Sprintf("content_type=%s", contentType), func(t *testing.T) {

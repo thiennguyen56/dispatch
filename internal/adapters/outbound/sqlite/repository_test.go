@@ -8,10 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/thiennguyen56/dispatch/internal/application"
 	"github.com/thiennguyen56/dispatch/internal/domain"
 	_ "modernc.org/sqlite"
 )
@@ -58,6 +61,168 @@ func TestRepositoryGetRoundTripsHeaders(t *testing.T) {
 	_, err = repository.Get(context.Background(), "missing")
 	if !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("Get(missing) error = %v, want %v", err, sql.ErrNoRows)
+	}
+}
+
+func testPendingDelivery(id string, key *string) domain.Delivery {
+	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	return domain.Delivery{
+		ID: id, URL: "https://example.com", Payload: "original",
+		Headers: map[string]string{"Content-Type": "text/plain"},
+		Status:  domain.DeliveryStatusPending, MaxAttempts: 8,
+		NextAttemptAt: now, CreatedAt: now, UpdatedAt: now, IdempotencyKey: key,
+	}
+}
+
+func TestRepositoryCreateIdempotency(t *testing.T) {
+	db := openTestDB(t)
+	repo := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+	key := "order-123"
+	original := testPendingDelivery("original", &key)
+	if err := repo.Create(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := testPendingDelivery("duplicate", &key)
+	duplicate.URL = "https://replacement.example"
+	duplicate.Payload = "replacement"
+	if err := repo.Create(ctx, duplicate); !errors.Is(err, application.ErrIdempotencyKeyExists) {
+		t.Fatalf("duplicate Create() error = %v", err)
+	}
+	got, err := repo.GetByIdempotencyKey(ctx, key)
+	if err != nil || !reflect.DeepEqual(got, &original) {
+		t.Fatalf("original delivery changed: %+v, %v", got, err)
+	}
+	if _, err := repo.Get(ctx, duplicate.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("duplicate ID was persisted: %v", err)
+	}
+	if _, err := repo.GetByIdempotencyKey(ctx, "missing"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing-key lookup error = %v", err)
+	}
+
+	for _, id := range []string{"unkeyed-1", "unkeyed-2"} {
+		if err := repo.Create(ctx, testPendingDelivery(id, nil)); err != nil {
+			t.Fatalf("unkeyed Create(): %v", err)
+		}
+		got, err := repo.Get(ctx, id)
+		if err != nil || got.IdempotencyKey != nil {
+			t.Fatalf("unkeyed delivery = %+v, %v", got, err)
+		}
+	}
+}
+
+func TestRepositoryCreateReturnsUnrelatedErrors(t *testing.T) {
+	db := openTestDB(t)
+	repo := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+	if err := repo.Create(ctx, testPendingDelivery("existing", nil)); err != nil {
+		t.Fatal(err)
+	}
+	invalid := testPendingDelivery("invalid", nil)
+	invalid.MaxAttempts = 0
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	for _, tc := range []struct {
+		name     string
+		ctx      context.Context
+		delivery domain.Delivery
+	}{
+		{"primary-key conflict", ctx, testPendingDelivery("existing", nil)},
+		{"check constraint", ctx, invalid},
+		{"canceled context", canceled, testPendingDelivery("canceled", nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := repo.Create(tc.ctx, tc.delivery)
+			if err == nil || errors.Is(err, application.ErrIdempotencyKeyExists) {
+				t.Fatalf("Create error = %v, want unrelated error", err)
+			}
+			if tc.ctx == canceled && !errors.Is(err, context.Canceled) {
+				t.Errorf("cancellation was not preserved: %v", err)
+			}
+		})
+	}
+}
+
+// Force both initial service lookups to finish before either inserts. This
+// exercises the conflict fallback using separate file-backed connections.
+type synchronizedLookupRepository struct {
+	*Repository
+	lookups *atomic.Int32
+	ready   chan struct{}
+}
+
+func (r synchronizedLookupRepository) GetByIdempotencyKey(ctx context.Context, key string) (*domain.Delivery, error) {
+	delivery, err := r.Repository.GetByIdempotencyKey(ctx, key)
+	count := r.lookups.Add(1)
+	if count <= 2 {
+		if count == 2 {
+			close(r.ready)
+		}
+		select {
+		case <-r.ready:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return delivery, err
+}
+
+func TestServiceConcurrentSubmissionsReturnSameDelivery(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "dispatch.db") + "?_pragma=busy_timeout(3000)"
+	var databases [2]*sql.DB
+	for i := range databases {
+		db, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.SetMaxOpenConns(1)
+		databases[i] = db
+		t.Cleanup(func() { _ = db.Close() })
+	}
+	applyTestMigration(t, databases[0], "001_init.up.sql")
+	applyTestMigration(t, databases[0], "002_normalize_timestamps.up.sql")
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var lookups atomic.Int32
+	ready := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	key := "concurrent-request"
+	type result struct {
+		delivery *domain.Delivery
+		err      error
+	}
+	results := make(chan result, 2)
+	for _, db := range databases {
+		repo := synchronizedLookupRepository{NewRepository(db, log), &lookups, ready}
+		service := application.NewService(log, repo)
+		go func() {
+			delivery, err := service.Submit(ctx, application.InputSubmit{
+				URL: "https://example.com", Payload: "original", IdempotencyKey: &key,
+			})
+			results <- result{delivery, err}
+		}()
+	}
+	var winner *domain.Delivery
+	for range 2 {
+		var got result
+		select {
+		case got = <-results:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		if got.err != nil || got.delivery == nil {
+			t.Fatalf("concurrent submission = %+v, %v", got.delivery, got.err)
+		}
+		if winner == nil {
+			winner = got.delivery
+		} else if winner.ID != got.delivery.ID || winner.URL != got.delivery.URL ||
+			winner.Payload != got.delivery.Payload || !winner.CreatedAt.Equal(got.delivery.CreatedAt) {
+			t.Fatalf("submissions returned different deliveries: %+v / %+v", winner, got.delivery)
+		}
+	}
+	var count int
+	if err := databases[0].QueryRow("SELECT count(*) FROM deliveries").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("persisted count = %d, error = %v; want 1", count, err)
 	}
 }
 

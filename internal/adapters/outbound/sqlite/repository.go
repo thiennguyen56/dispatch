@@ -35,7 +35,7 @@ func (r *Repository) Create(
 		headersJSON = []byte("{}")
 	}
 
-	_, err = r.db.ExecContext(ctx,
+	result, err := r.db.ExecContext(ctx,
 		insertDelivery,
 		d.ID,
 		d.URL,
@@ -53,8 +53,20 @@ func (r *Repository) Create(
 		formatTime(d.UpdatedAt),
 		formatOptionalTime(d.DeliveredAt),
 	)
+	if err != nil {
+		return fmt.Errorf("create delivery: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check delivery insertion: %w", err)
+	}
+
+	if affected == 0 {
+		return application.ErrIdempotencyKeyExists
+	}
+
 	r.logger.Info("created delivery", "id", d.ID)
-	return err
+	return nil
 }
 
 func (r *Repository) Get(ctx context.Context, id string) (*domain.Delivery, error) {
@@ -77,6 +89,36 @@ func (r *Repository) Get(ctx context.Context, id string) (*domain.Delivery, erro
 		&row.DeliveredAt,
 	); err != nil {
 		r.logger.Error("get delivery", "id", id, "error", err)
+		return nil, err
+	}
+
+	delivery, err := row.toDomain()
+	if err != nil {
+		return nil, fmt.Errorf("map delivery row: %w", err)
+	}
+	return delivery, nil
+}
+
+func (r *Repository) GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.Delivery, error) {
+	var row deliveryRow
+	if err := r.db.QueryRowContext(ctx, getDeliveryByIdempotencyKey, idempotencyKey).Scan(
+		&row.ID,
+		&row.URL,
+		&row.Payload,
+		&row.HeadersJSON,
+		&row.Status,
+		&row.AttemptsMade,
+		&row.MaxAttempts,
+		&row.NextAttemptAt,
+		&row.LeaseToken,
+		&row.LeaseExpiresAt,
+		&row.LastError,
+		&row.IdempotencyKey,
+		&row.CreatedAt,
+		&row.UpdatedAt,
+		&row.DeliveredAt,
+	); err != nil {
+		r.logger.Error("get delivery by idempotency key", "idempotencyKey", idempotencyKey, "error", err)
 		return nil, err
 	}
 
@@ -188,7 +230,9 @@ func (r *Repository) FinalizeAttempt(
 	if err != nil {
 		return fmt.Errorf("begin finalization: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() {
+		_ = tx.Rollback()
+	}()
 
 	var attemptNumber int
 	err = tx.QueryRowContext(
