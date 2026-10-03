@@ -3,6 +3,8 @@ package bootstrap
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -49,8 +51,12 @@ func (a *App) Run() error {
 	sender := webhook.NewSender(log)
 	processor := application.NewProcessor(log, repo, sender)
 	worker := worker.NewWorker(log, processor, 5*time.Second)
+
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+
+	workerDone := make(chan error, 1)
 	go func() {
-		worker.Run(ctx)
+		workerDone <- worker.Run(workerCtx)
 	}()
 
 	router := httpapi.NewRouter(log, service)
@@ -61,25 +67,52 @@ func (a *App) Run() error {
 		ReadTimeout:  a.config.Server.ReadTimeout,
 	}
 
+	serverDone := make(chan error, 1)
 	log.Info("server started", "addr", srv.Addr)
 	go func() {
-		srv.ListenAndServe()
+		serverDone <- srv.ListenAndServe()
 	}()
 
-	<-ctx.Done()
-	log.Info("Shutdown signal received. Starting graceful shutdown...")
+	var runErr error
+
+	select {
+	case <-ctx.Done():
+	case err := <-serverDone:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			runErr = fmt.Errorf("HTTP server failed: %w", err)
+		}
+	}
+	cancelWorker()
+
+	return errors.Join(runErr, shutdown(srv, workerDone, db))
+}
+
+func shutdown(srv *http.Server, workerDone chan error, db *sql.DB) error {
+	var runErr error
+	slog.Info("Shutdown signal received. Starting graceful shutdown...")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Info("Server forced to shutdown", "error", err)
+		slog.Info("Server forced to shutdown", "error", err)
+		runErr = errors.Join(runErr, fmt.Errorf("shutdown HTTP server: %w", err))
+		_ = srv.Close() // Force-close remaining HTTP connections.
 	} else {
-		log.Info("Server stopped gracefully.")
+		slog.Info("Server stopped gracefully.")
+	}
+
+	select {
+	case err := <-workerDone:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			runErr = errors.Join(runErr, fmt.Errorf("stop worker: %w", err))
+		}
+	case <-shutdownCtx.Done():
+		runErr = errors.Join(runErr, errors.New("worker shutdown timed out"))
 	}
 
 	if err := db.Close(); err != nil {
-		log.Info("failed to close database", "error", err)
+		runErr = errors.Join(runErr, fmt.Errorf("close database: %w", err))
 	}
-	return nil
+	return runErr
 }
