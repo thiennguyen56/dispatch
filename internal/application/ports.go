@@ -11,6 +11,9 @@ type DeliveryRepository interface {
 	Create(ctx context.Context, delivery domain.Delivery) error
 	Get(ctx context.Context, id string) (*domain.Delivery, error)
 	GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.Delivery, error)
+
+	ListAttempts(ctx context.Context, deliveryID string) ([]*domain.Attempt, error)
+	ListDeliveries(ctx context.Context, query ListDeliveriesQuery) (*DeliveryPage, error)
 	ClaimNext(ctx context.Context, now time.Time, leaseDuration time.Duration) (*domain.Delivery, error)
 
 	FinalizeAttempt(

@@ -23,6 +23,8 @@ func (r *Router) DeliveryRouter() *mux.Router {
 	router := mux.NewRouter()
 	router.HandleFunc("/deliveries", handler.Submit).Methods("POST")
 	router.HandleFunc("/deliveries/{id}", handler.Get).Methods("GET")
+	router.HandleFunc("/deliveries", handler.ListDeliveries).Methods("GET")
+	router.HandleFunc("/deliveries/{id}/attempts", handler.ListAttempts).Methods("GET")
 
 	return router
 }

@@ -75,3 +75,11 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, delivery)
 }
+
+func (h *Handler) ListDeliveries(w http.ResponseWriter, r *http.Request) {
+	panic("not implemented")
+}
+
+func (h *Handler) ListAttempts(w http.ResponseWriter, r *http.Request) {
+	panic("not implemented")
+}

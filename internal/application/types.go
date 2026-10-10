@@ -81,3 +81,14 @@ func (input FinalizeAttemptInput) Validate() error {
 
 	return nil
 }
+
+type ListDeliveriesQuery struct {
+	Status *domain.DeliveryStatus
+	Limit  uint
+	Cursor string
+}
+
+type DeliveryPage struct {
+	Deliveries []domain.Delivery
+	NextCursor string
+}

@@ -41,6 +41,14 @@ func (r *repositoryStub) Get(context.Context, string) (*domain.Delivery, error) 
 	return r.getDelivery, r.getErr
 }
 
+func (r *repositoryStub) ListDeliveries(_ context.Context, _ ListDeliveriesQuery) (*DeliveryPage, error) {
+	return nil, nil
+}
+
+func (r *repositoryStub) ListAttempts(_ context.Context, _ string) ([]*domain.Attempt, error) {
+	return nil, nil
+}
+
 func (r *repositoryStub) ClaimNext(_ context.Context, _ time.Time, _ time.Duration) (*domain.Delivery, error) {
 	return nil, nil
 }

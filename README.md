@@ -112,11 +112,26 @@ make migrate-up DB_PATH=tmp/test.db
 
 ## Docker Compose
 
-`compose.yaml` builds and runs the HTTP service on port `8080`. It declares a
-named volume intended for SQLite data. The current bootstrap still opens the
-hard-coded `dispatch.db` path, so `DISPATCH_DB_PATH` and that volume are **not
-yet wired together**. Run locally with the migration commands above until the
-database-path configuration is implemented.
+`compose.yaml` builds and runs the HTTP service on port `8080`, using the
+`dispatch-sqlite` named volume for database storage. Configuration loads `.env`
+locally and preserves existing environment variables. Compose passes `.env`
+variables into the container and overrides `DISPATCH_DB_PATH` with
+`/var/lib/dispatch/dispatch.db`. Create a local `.env` file before using Compose.
+
+Bootstrap creates the database directory and verifies the connection before
+starting workers. The image creates `/var/lib/dispatch` owned by the `dispatch`
+user. Existing volumes may need their ownership corrected once:
+
+```bash
+podman compose build
+podman compose run --rm --no-deps --user root --entrypoint chown dispatch -R dispatch:dispatch /var/lib/dispatch
+make compose-up RECREATE=1
+```
+
+The database inside the named volume must also have the schema migrations
+applied. The runtime image does not currently include a migration runner;
+running `make migrate-up` on the host updates the host database, not the named
+volume database. Automatic container schema initialization remains to be added.
 
 ## Development
 

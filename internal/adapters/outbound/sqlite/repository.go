@@ -214,6 +214,17 @@ func (r *Repository) ClaimNext(ctx context.Context, now time.Time, leaseDuration
 	return delRow.toDomain()
 }
 
+func (r *Repository) ListDeliveries(
+	ctx context.Context,
+	query application.ListDeliveriesQuery,
+) (*application.DeliveryPage, error) {
+	return nil, nil
+}
+
+func (r *Repository) ListAttempts(ctx context.Context, deliveryID string) ([]*domain.Attempt, error) {
+	return nil, nil
+}
+
 func (r *Repository) FinalizeAttempt(
 	ctx context.Context,
 	input application.FinalizeAttemptInput,

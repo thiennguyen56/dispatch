@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -41,11 +42,22 @@ func (a *App) Run() error {
 		JSON:    true,
 	})
 
-	db, err := sql.Open("sqlite", "dispatch.db")
-	if err != nil {
-		log.Error("failed to open database", "error", err)
-		return err
+	dbPath := a.config.Database.URL
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+		return fmt.Errorf("create database directory for %q: %w", dbPath, err)
 	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("open database %q: %w", dbPath, err)
+	}
+	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
+	err = db.PingContext(pingCtx)
+	cancelPing()
+	if err != nil {
+		_ = db.Close()
+		return fmt.Errorf("connect to database %q: %w", dbPath, err)
+	}
+	log.Info("database connected", "path", dbPath)
 	repo := sqlite.NewRepository(db, log)
 	service := application.NewService(log, repo)
 	sender := webhook.NewSender(log)
