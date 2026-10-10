@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -392,5 +393,261 @@ func TestClaimSQLTimestampBoundaries(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestRepositoryListAttempts(t *testing.T) {
+	db := openTestDB(t)
+	repo := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for _, id := range []string{"delivery-1", "other", "empty"} {
+		if err := repo.Create(ctx, testPendingDelivery(id, nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	started := time.Date(2026, 10, 10, 12, 0, 0, 123456789, time.UTC)
+	finished := started.Add(1500 * time.Millisecond)
+	status := 503
+	message := "webhook request failed with status 503"
+	outcome := domain.AttemptOutcomeFailed
+	// Insert out of order to verify ordering comes from the query, not insertion.
+	insertTestAttempt(t, db, "delivery-1", 2, formatTime(started), formatTime(finished), string(outcome), status, message, 1500)
+	insertTestAttempt(t, db, "other", 1, formatTime(started), nil, nil, nil, nil, nil)
+	insertTestAttempt(t, db, "delivery-1", 1, formatTime(started), nil, nil, nil, nil, nil)
+	got, err := repo.ListAttempts(ctx, "delivery-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d attempts, want 2", len(got))
+	}
+	want := []*domain.Attempt{
+		{ID: 1, DeliveryID: "delivery-1", AttemptNumber: 2, StartedAt: started, FinishedAt: &finished, Outcome: &outcome, ResponseStatus: &status, ErrorMessage: &message, Duration: 1500 * time.Millisecond},
+		{ID: 3, DeliveryID: "delivery-1", AttemptNumber: 1, StartedAt: started},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("attempts=%#v / %#v, want %#v / %#v", got[0], got[1], want[0], want[1])
+	}
+	for _, id := range []string{"empty", "missing"} {
+		got, err := repo.ListAttempts(ctx, id)
+		if err != nil || got == nil || len(got) != 0 {
+			t.Fatalf("ListAttempts(%q)=%+v, %v; want non-nil empty slice", id, got, err)
+		}
+	}
+}
+
+func insertTestAttempt(t *testing.T, db *sql.DB, id string, number int, started string, finished, outcome, status, message, duration any) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO delivery_attempts
+ (delivery_id, attempt_number, started_at, finished_at, outcome, response_status, error_message, duration_ms)
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, id, number, started, finished, outcome, status, message, duration); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRepositoryListAttemptsErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, started string
+		finished      any
+		want          string
+	}{
+		{"invalid start time", "invalid", nil, "parse attempt 1 start time"},
+		{"invalid finish time", "2026-10-10T12:00:00Z", "invalid", "parse attempt 1 finish time"},
+		{"invalid duration", "2026-10-10T12:00:00Z", nil, "scan delivery attempt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			repo := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := repo.Create(ctx, testPendingDelivery("delivery-1", nil)); err != nil {
+				t.Fatal(err)
+			}
+			var duration any
+			if tc.name == "invalid duration" {
+				duration = "not-a-number"
+			}
+			insertTestAttempt(t, db, "delivery-1", 1, tc.started, tc.finished, nil, nil, nil, duration)
+			got, err := repo.ListAttempts(ctx, "delivery-1")
+			if got != nil || err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("attempts=%+v, error=%v; want %q", got, err, tc.want)
+			}
+			// With only one connection, this fails if the error path leaves rows open.
+			if err := db.PingContext(ctx); err != nil {
+				t.Fatalf("connection not released after mapping error: %v", err)
+			}
+		})
+	}
+	t.Run("canceled context", func(t *testing.T) {
+		repo := NewRepository(openTestDB(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		got, err := repo.ListAttempts(ctx, "delivery-1")
+		if got != nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("attempts=%+v, error=%v", got, err)
+		}
+	})
+	t.Run("query failure", func(t *testing.T) {
+		db := openTestDB(t)
+		repo := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if _, err := db.Exec("DROP TABLE delivery_attempts"); err != nil {
+			t.Fatal(err)
+		}
+		got, err := repo.ListAttempts(context.Background(), "delivery-1")
+		if got != nil || err == nil {
+			t.Fatalf("attempts=%+v, error=%v", got, err)
+		}
+	})
+}
+
+func TestRepositoryFinalizeAttemptHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		retry       bool
+		maxAttempts int
+		want        domain.DeliveryStatus
+	}{
+		{"permanent failure", false, 8, domain.DeliveryStatusDeadLetter},
+		{"retryable failure", true, 8, domain.DeliveryStatusPending},
+		{"exhausted attempts", true, 1, domain.DeliveryStatusDeadLetter},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			repo := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			ctx := context.Background()
+			delivery := testPendingDelivery("delivery-1", nil)
+			delivery.MaxAttempts = tc.maxAttempts
+			if err := repo.Create(ctx, delivery); err != nil {
+				t.Fatal(err)
+			}
+			claim, err := repo.ClaimNext(ctx, delivery.CreatedAt, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			started := delivery.CreatedAt
+			finished := started.Add(1500 * time.Millisecond)
+			status := 404
+			if tc.retry {
+				status = 503
+			}
+			message := fmt.Sprintf("webhook request failed with status %d", status)
+			input := application.FinalizeAttemptInput{
+				DeliveryID: delivery.ID, LeaseToken: *claim.LeaseToken, ErrorMessage: &message,
+				Result: application.SendResult{StartedAt: started, FinishedAt: finished, Duration: 1500 * time.Millisecond, Outcome: domain.AttemptOutcomeFailed, ResponseStatus: &status},
+			}
+			if tc.retry {
+				retryAt := finished.Add(time.Minute)
+				input.RetryAt = &retryAt
+			}
+			if err := repo.FinalizeAttempt(ctx, input, finished); err != nil {
+				t.Fatal(err)
+			}
+			got, err := repo.Get(ctx, delivery.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != tc.want || got.AttemptsMade != 1 || got.LastError == nil || *got.LastError != message || got.LeaseToken != nil || got.LeaseExpiresAt != nil {
+				t.Fatalf("incorrect finalized delivery: %+v", got)
+			}
+			if tc.want == domain.DeliveryStatusPending && !got.NextAttemptAt.Equal(*input.RetryAt) {
+				t.Fatalf("incorrect retry time: %v", got.NextAttemptAt)
+			}
+			attempts, err := repo.ListAttempts(ctx, delivery.ID)
+			if err != nil || len(attempts) != 1 {
+				t.Fatalf("attempts=%+v, error=%v", attempts, err)
+			}
+			attempt := attempts[0]
+			if attempt.AttemptNumber != 1 || attempt.ErrorMessage == nil || *attempt.ErrorMessage != message || attempt.ResponseStatus == nil || *attempt.ResponseStatus != status || attempt.Duration != input.Result.Duration || attempt.Outcome == nil || *attempt.Outcome != input.Result.Outcome {
+				t.Fatalf("incorrect attempt: %+v", attempt)
+			}
+			// Repeated finalization must not increment the counter or add an attempt.
+			if err := repo.FinalizeAttempt(ctx, input, finished); !errors.Is(err, application.ErrLeaseLost) {
+				t.Fatalf("duplicate finalization error=%v", err)
+			}
+			attempts, err = repo.ListAttempts(ctx, delivery.ID)
+			if err != nil || len(attempts) != 1 {
+				t.Fatalf("duplicate attempt persisted: %+v, %v", attempts, err)
+			}
+			if tc.want != domain.DeliveryStatusPending {
+				return
+			}
+			// A successful retry clears last_error while preserving the failed history.
+			claim, err = repo.ClaimNext(ctx, *input.RetryAt, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			status = 204
+			input = application.FinalizeAttemptInput{DeliveryID: delivery.ID, LeaseToken: *claim.LeaseToken,
+				Result: application.SendResult{StartedAt: *input.RetryAt, FinishedAt: input.RetryAt.Add(time.Second), Duration: time.Second, Outcome: domain.AttemptOutcomeSucceeded, ResponseStatus: &status}}
+			if err := repo.FinalizeAttempt(ctx, input, input.Result.FinishedAt); err != nil {
+				t.Fatal(err)
+			}
+			got, err = repo.Get(ctx, delivery.ID)
+			if err != nil || got.Status != domain.DeliveryStatusDelivered || got.AttemptsMade != 2 || got.LastError != nil || got.DeliveredAt == nil || !got.DeliveredAt.Equal(input.Result.FinishedAt) {
+				t.Fatalf("successful retry=%+v, %v", got, err)
+			}
+			attempts, err = repo.ListAttempts(ctx, delivery.ID)
+			if err != nil || len(attempts) != 2 {
+				t.Fatalf("history=%+v, %v", attempts, err)
+			}
+			if attempts[0].AttemptNumber != 2 || attempts[0].ErrorMessage != nil || attempts[1].ErrorMessage == nil || *attempts[1].ErrorMessage != message {
+				t.Fatalf("history not preserved: %+v / %+v", attempts[0], attempts[1])
+			}
+		})
+	}
+}
+
+func TestRepositoryFinalizationOwnershipAndRollback(t *testing.T) {
+	for _, mode := range []string{"reclaimed lease", "attempt insert failure"} {
+		t.Run(mode, func(t *testing.T) {
+			db := openTestDB(t)
+			repo := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			ctx := context.Background()
+			delivery := testPendingDelivery("delivery-1", nil)
+			if err := repo.Create(ctx, delivery); err != nil {
+				t.Fatal(err)
+			}
+			original, err := repo.ClaimNext(ctx, delivery.CreatedAt, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			finished := delivery.CreatedAt.Add(2 * time.Minute)
+			status := 204
+			input := application.FinalizeAttemptInput{DeliveryID: delivery.ID, LeaseToken: *original.LeaseToken,
+				Result: application.SendResult{StartedAt: delivery.CreatedAt, FinishedAt: finished, Duration: 2 * time.Minute, Outcome: domain.AttemptOutcomeSucceeded, ResponseStatus: &status}}
+			if mode == "reclaimed lease" {
+				replacement, err := repo.ClaimNext(ctx, finished, time.Minute)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if *replacement.LeaseToken == *original.LeaseToken {
+					t.Fatal("reclaim reused lease token")
+				}
+			} else {
+				if _, err := db.Exec(`CREATE TRIGGER reject_attempt BEFORE INSERT ON delivery_attempts BEGIN SELECT RAISE(ABORT, 'attempt insert failed'); END;`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := repo.Get(ctx, delivery.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = repo.FinalizeAttempt(ctx, input, finished)
+			if err == nil {
+				t.Fatal("expected finalization failure")
+			}
+			if mode == "reclaimed lease" && !errors.Is(err, application.ErrLeaseLost) {
+				t.Fatalf("error=%v, want lease lost", err)
+			}
+			after, getErr := repo.Get(ctx, delivery.ID)
+			if getErr != nil || !reflect.DeepEqual(after, before) {
+				t.Fatalf("failed finalization modified delivery: before=%+v after=%+v error=%v", before, after, getErr)
+			}
+			attempts, listErr := repo.ListAttempts(ctx, delivery.ID)
+			if listErr != nil || len(attempts) != 0 {
+				t.Fatalf("failed finalization persisted attempt: %+v, %v", attempts, listErr)
+			}
+		})
 	}
 }

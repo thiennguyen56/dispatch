@@ -222,7 +222,59 @@ func (r *Repository) ListDeliveries(
 }
 
 func (r *Repository) ListAttempts(ctx context.Context, deliveryID string) ([]*domain.Attempt, error) {
-	return nil, nil
+	rows, err := r.db.QueryContext(ctx,
+		listAttemptsByDeliveryID,
+		sql.Named("delivery_id", deliveryID))
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	attempts := make([]*domain.Attempt, 0, 8)
+	for rows.Next() {
+		var attempt domain.Attempt
+		var startedAt string
+		var finishedAt sql.NullString
+		var durationMS sql.NullInt64
+		if err := rows.Scan(
+			&attempt.ID,
+			&attempt.DeliveryID,
+			&attempt.AttemptNumber,
+			&startedAt,
+			&finishedAt,
+			&attempt.Outcome,
+			&attempt.ResponseStatus,
+			&attempt.ErrorMessage,
+			&durationMS,
+		); err != nil {
+			return nil, fmt.Errorf("scan delivery attempt: %w", err)
+		}
+		attempt.StartedAt, err = parseTime(startedAt)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"parse attempt %d start time: %w", attempt.ID, err,
+			)
+		}
+
+		attempt.FinishedAt, err = parseOptionalTime(finishedAt)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"parse attempt %d finish time: %w", attempt.ID, err,
+			)
+		}
+
+		if durationMS.Valid {
+			attempt.Duration = time.Duration(durationMS.Int64) * time.Millisecond
+		}
+		attempts = append(attempts, &attempt)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate delivery attempts: %w", err)
+	}
+
+	return attempts, nil
 }
 
 func (r *Repository) FinalizeAttempt(

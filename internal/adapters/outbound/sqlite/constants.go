@@ -176,3 +176,19 @@ INSERT INTO delivery_attempts (
     :duration_ms
 )
 `
+
+const listAttemptsByDeliveryID = `
+SELECT
+    id,
+    delivery_id,
+    attempt_number,
+    started_at,
+    finished_at,
+    outcome,
+    response_status,
+    error_message,
+    duration_ms
+FROM delivery_attempts
+WHERE delivery_id = :delivery_id
+ORDER BY attempt_number DESC;
+`

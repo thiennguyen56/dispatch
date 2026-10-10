@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/gorilla/mux"
 	"github.com/thiennguyen56/dispatch/internal/application"
@@ -14,6 +15,7 @@ import (
 type Service interface {
 	Submit(ctx context.Context, input application.InputSubmit) (*domain.Delivery, error)
 	Get(ctx context.Context, id string) (*domain.Delivery, error)
+	ListAttempts(ctx context.Context, deliveryID string) ([]*domain.Attempt, error)
 }
 
 type Handler struct {
@@ -81,5 +83,18 @@ func (h *Handler) ListDeliveries(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListAttempts(w http.ResponseWriter, r *http.Request) {
-	panic("not implemented")
+	vars := mux.Vars(r)
+	deliveryID := vars["id"]
+	if strings.TrimSpace(deliveryID) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "id query parameter is required")
+		return
+	}
+	attempts, err := h.service.ListAttempts(r.Context(), deliveryID)
+	if err != nil {
+		h.logger.Error("failed to list attempts from service layer", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, attempts)
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"reflect"
 	"testing"
 	"time"
 
@@ -16,12 +17,15 @@ import (
 )
 
 type repositoryStub struct {
-	created     domain.Delivery
-	createErr   error
-	getDelivery *domain.Delivery
-	getErr      error
-	createCalls int
-	lookup      func(context.Context, string) (*domain.Delivery, error)
+	claim        func(context.Context, time.Time, time.Duration) (*domain.Delivery, error)
+	finalize     func(context.Context, FinalizeAttemptInput, time.Time) error
+	listAttempts func(context.Context, string) ([]*domain.Attempt, error)
+	created      domain.Delivery
+	createErr    error
+	getDelivery  *domain.Delivery
+	getErr       error
+	createCalls  int
+	lookup       func(context.Context, string) (*domain.Delivery, error)
 }
 
 func (r *repositoryStub) Create(_ context.Context, delivery domain.Delivery) error {
@@ -45,19 +49,24 @@ func (r *repositoryStub) ListDeliveries(_ context.Context, _ ListDeliveriesQuery
 	return nil, nil
 }
 
-func (r *repositoryStub) ListAttempts(_ context.Context, _ string) ([]*domain.Attempt, error) {
+func (r *repositoryStub) ListAttempts(ctx context.Context, id string) ([]*domain.Attempt, error) {
+	if r.listAttempts != nil {
+		return r.listAttempts(ctx, id)
+	}
+	return []*domain.Attempt{}, nil
+}
+
+func (r *repositoryStub) ClaimNext(ctx context.Context, now time.Time, lease time.Duration) (*domain.Delivery, error) {
+	if r.claim != nil {
+		return r.claim(ctx, now, lease)
+	}
 	return nil, nil
 }
 
-func (r *repositoryStub) ClaimNext(_ context.Context, _ time.Time, _ time.Duration) (*domain.Delivery, error) {
-	return nil, nil
-}
-
-func (r *repositoryStub) FinalizeAttempt(
-	_ context.Context,
-	_ FinalizeAttemptInput,
-	_ time.Time,
-) error {
+func (r *repositoryStub) FinalizeAttempt(ctx context.Context, input FinalizeAttemptInput, now time.Time) error {
+	if r.finalize != nil {
+		return r.finalize(ctx, input, now)
+	}
 	return nil
 }
 
@@ -243,6 +252,181 @@ func TestServiceSubmitIdempotency(t *testing.T) {
 				}
 			} else if got == nil || got.IdempotencyKey == nil || *got.IdempotencyKey != key || got.ID != repo.created.ID {
 				t.Errorf("new submission did not preserve key/ID: %+v", got)
+			}
+		})
+	}
+}
+
+func TestServiceListAttempts(t *testing.T) {
+	t.Parallel()
+	failure := errors.New("database unavailable")
+	for _, tc := range []struct {
+		name     string
+		attempts []*domain.Attempt
+		err      error
+	}{
+		{name: "returns history", attempts: []*domain.Attempt{{ID: 2, DeliveryID: "delivery-1", AttemptNumber: 2}, {ID: 1, DeliveryID: "delivery-1", AttemptNumber: 1}}},
+		{name: "returns empty history", attempts: []*domain.Attempt{}},
+		{name: "propagates repository error", err: failure},
+		{name: "preserves cancellation", err: context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if errors.Is(tc.err, context.Canceled) {
+				cancel()
+			}
+			calls := 0
+			repo := &repositoryStub{listAttempts: func(gotCtx context.Context, id string) ([]*domain.Attempt, error) {
+				calls++
+				if gotCtx != ctx || id != "delivery-1" {
+					t.Errorf("unexpected context or ID: %v / %q", gotCtx, id)
+				}
+				return tc.attempts, tc.err
+			}}
+			service := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)), repo)
+			got, err := service.ListAttempts(ctx, "delivery-1")
+			if calls != 1 || !errors.Is(err, tc.err) || !reflect.DeepEqual(got, tc.attempts) {
+				t.Fatalf("calls=%d, attempts=%+v, error=%v", calls, got, err)
+			}
+		})
+	}
+}
+
+type senderFunc func(context.Context, domain.Delivery) (SendResult, error)
+
+func (f senderFunc) Send(ctx context.Context, d domain.Delivery) (SendResult, error) {
+	return f(ctx, d)
+}
+
+func TestProcessorFinalizesOutcomes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name            string
+		status          int
+		outcome         domain.AttemptOutcome
+		sendErr         error
+		retry           bool
+		message         string
+		cancelAfterSend bool
+	}{
+		{name: "success", status: 204, outcome: domain.AttemptOutcomeSucceeded},
+		{name: "404 without Go error", status: 404, outcome: domain.AttemptOutcomeFailed, message: "webhook request failed with status 404"},
+		{name: "408 without Go error", status: 408, outcome: domain.AttemptOutcomeFailed, retry: true, message: "webhook request failed with status 408"},
+		{name: "429 without Go error", status: 429, outcome: domain.AttemptOutcomeFailed, retry: true, message: "webhook request failed with status 429"},
+		{name: "503 without Go error", status: 503, outcome: domain.AttemptOutcomeFailed, retry: true, message: "webhook request failed with status 503"},
+		{name: "transport failure", outcome: domain.AttemptOutcomeFailed, sendErr: errors.New("private transport details"), retry: true, message: "webhook transport failed"},
+		{name: "timeout", outcome: domain.AttemptOutcomeTimedOut, sendErr: context.DeadlineExceeded, retry: true, message: "webhook request timed out"},
+		{name: "success during shutdown", status: 204, outcome: domain.AttemptOutcomeSucceeded, cancelAfterSend: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			token := "lease-1"
+			claim := &domain.Delivery{ID: "delivery-1", LeaseToken: &token}
+			started := time.Now().Add(-time.Second)
+			result := SendResult{StartedAt: started, FinishedAt: started.Add(time.Millisecond), Duration: time.Millisecond, Outcome: tc.outcome}
+			if tc.status != 0 {
+				result.ResponseStatus = &tc.status
+			}
+			claims, sends, finalizations := 0, 0, 0
+			repo := &repositoryStub{
+				claim: func(gotCtx context.Context, now time.Time, lease time.Duration) (*domain.Delivery, error) {
+					claims++
+					if gotCtx != ctx || now.IsZero() || lease <= 0 {
+						t.Error("invalid claim arguments")
+					}
+					return claim, nil
+				},
+				finalize: func(finalCtx context.Context, input FinalizeAttemptInput, now time.Time) error {
+					finalizations++
+					if finalCtx.Err() != nil {
+						t.Errorf("finalization context canceled: %v", finalCtx.Err())
+					}
+					if deadline, ok := finalCtx.Deadline(); !ok || deadline.After(time.Now().Add(finalizeTimeout)) {
+						t.Error("finalization must have bounded deadline")
+					}
+					if input.DeliveryID != claim.ID || input.LeaseToken != token || !reflect.DeepEqual(input.Result, result) || now.Before(result.FinishedAt) {
+						t.Errorf("incorrect finalization: %+v", input)
+					}
+					if tc.message == "" {
+						if input.ErrorMessage != nil {
+							t.Errorf("success has error: %v", input.ErrorMessage)
+						}
+					} else if input.ErrorMessage == nil || *input.ErrorMessage != tc.message {
+						t.Errorf("error message=%v, want %q", input.ErrorMessage, tc.message)
+					}
+					if tc.retry {
+						if input.RetryAt == nil || !input.RetryAt.Equal(result.FinishedAt.Add(time.Minute)) {
+							t.Errorf("retry time=%v", input.RetryAt)
+						}
+					} else if input.RetryAt != nil {
+						t.Errorf("unexpected retry=%v", input.RetryAt)
+					}
+					return nil
+				},
+			}
+			sender := senderFunc(func(gotCtx context.Context, d domain.Delivery) (SendResult, error) {
+				sends++
+				if gotCtx != ctx || d.ID != claim.ID {
+					t.Error("unexpected send arguments")
+				}
+				if tc.cancelAfterSend {
+					cancel()
+				}
+				return result, tc.sendErr
+			})
+			processor := NewProcessor(slog.New(slog.NewTextHandler(io.Discard, nil)), repo, sender)
+			if err := processor.ProcessNext(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if claims != 1 || sends != 1 || finalizations != 1 {
+				t.Fatalf("claims=%d sends=%d finalizations=%d", claims, sends, finalizations)
+			}
+		})
+	}
+}
+
+func TestProcessorPropagatesRepositoryErrors(t *testing.T) {
+	t.Parallel()
+	claimFailure := errors.New("claim failed")
+	for _, tc := range []struct {
+		name                  string
+		claimErr, finalizeErr error
+	}{
+		{name: "no job", claimErr: ErrNoJob{}},
+		{name: "claim failure", claimErr: claimFailure},
+		{name: "lease lost", finalizeErr: ErrLeaseLost},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token := "lease-1"
+			sends, finalizations := 0, 0
+			repo := &repositoryStub{
+				claim: func(context.Context, time.Time, time.Duration) (*domain.Delivery, error) {
+					return &domain.Delivery{ID: "delivery-1", LeaseToken: &token}, tc.claimErr
+				},
+				finalize: func(context.Context, FinalizeAttemptInput, time.Time) error { finalizations++; return tc.finalizeErr },
+			}
+			sender := senderFunc(func(context.Context, domain.Delivery) (SendResult, error) {
+				sends++
+				now := time.Now()
+				status := 204
+				return SendResult{StartedAt: now, FinishedAt: now, Outcome: domain.AttemptOutcomeSucceeded, ResponseStatus: &status}, nil
+			})
+			processor := NewProcessor(slog.New(slog.NewTextHandler(io.Discard, nil)), repo, sender)
+			err := processor.ProcessNext(context.Background())
+			want := tc.claimErr
+			if want == nil {
+				want = tc.finalizeErr
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("error=%v, want %v", err, want)
+			}
+			if tc.claimErr != nil && (sends != 0 || finalizations != 0) {
+				t.Fatalf("processed unclaimed delivery: sends=%d finalizations=%d", sends, finalizations)
+			}
+			if tc.claimErr == nil && (sends != 1 || finalizations != 1) {
+				t.Fatalf("sends=%d finalizations=%d", sends, finalizations)
 			}
 		})
 	}

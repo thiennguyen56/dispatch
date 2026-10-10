@@ -68,3 +68,13 @@ func (s *Service) Get(ctx context.Context, id string) (*domain.Delivery, error) 
 	}
 	return delivery, nil
 }
+
+func (s *Service) ListAttempts(ctx context.Context, deliveryID string) ([]*domain.Attempt, error) {
+	attempts, err := s.repo.ListAttempts(ctx, deliveryID)
+	if err != nil {
+		s.logger.Error("failed to list attempts from repo level", "error", err)
+		return nil, err
+	}
+
+	return attempts, nil
+}

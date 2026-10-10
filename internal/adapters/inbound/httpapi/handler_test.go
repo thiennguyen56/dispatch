@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/thiennguyen56/dispatch/internal/application"
@@ -17,10 +19,11 @@ import (
 )
 
 type serviceStub struct {
-	delivery  *domain.Delivery
-	submitErr error
-	getErr    error
-	submit    func(context.Context, application.InputSubmit) (*domain.Delivery, error)
+	listAttempts func(context.Context, string) ([]*domain.Attempt, error)
+	delivery     *domain.Delivery
+	submitErr    error
+	getErr       error
+	submit       func(context.Context, application.InputSubmit) (*domain.Delivery, error)
 }
 
 func (s serviceStub) Submit(ctx context.Context, input application.InputSubmit) (*domain.Delivery, error) {
@@ -224,4 +227,73 @@ func TestHandlerSubmitSuccessUsesJSONResponse(t *testing.T) {
 	if got, want := body["id"], "delivery-1"; got != want {
 		t.Errorf("id = %q, want %q", got, want)
 	}
+}
+
+func (s serviceStub) ListAttempts(ctx context.Context, id string) ([]*domain.Attempt, error) {
+	if s.listAttempts != nil {
+		return s.listAttempts(ctx, id)
+	}
+	return []*domain.Attempt{}, nil
+}
+
+func TestHandlerListAttempts(t *testing.T) {
+	t.Parallel()
+	t.Run("returns attempts and forwards request context and ID", func(t *testing.T) {
+		want := []*domain.Attempt{{ID: 2, DeliveryID: "delivery-1", AttemptNumber: 2, StartedAt: time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC), Duration: 1500 * time.Millisecond}}
+		req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/deliveries/delivery-1/attempts", nil), map[string]string{"id": "delivery-1"})
+		calls := 0
+		handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{
+			listAttempts: func(ctx context.Context, id string) ([]*domain.Attempt, error) {
+				calls++
+				if ctx != req.Context() || id != "delivery-1" {
+					t.Errorf("unexpected context or ID: %v / %q", ctx, id)
+				}
+				return want, nil
+			},
+		})
+		response := httptest.NewRecorder()
+		handler.ListAttempts(response, req)
+		if response.Code != http.StatusOK || calls != 1 {
+			t.Fatalf("status=%d, calls=%d", response.Code, calls)
+		}
+		if response.Header().Get("Content-Type") != "application/json" {
+			t.Errorf("unexpected content type: %s", response.Header().Get("Content-Type"))
+		}
+		var got []*domain.Attempt
+		if err := json.NewDecoder(response.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("attempts=%+v, want %+v", got, want)
+		}
+	})
+	t.Run("empty attempts serialize as array", func(t *testing.T) {
+		handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{})
+		response := httptest.NewRecorder()
+		req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/deliveries/empty/attempts", nil), map[string]string{"id": "empty"})
+		handler.ListAttempts(response, req)
+		if response.Code != http.StatusOK || string(bytes.TrimSpace(response.Body.Bytes())) != "[]" {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body)
+		}
+	})
+	for _, id := range []string{"", "   "} {
+		t.Run("rejects ID="+id, func(t *testing.T) {
+			handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			response := httptest.NewRecorder()
+			req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/deliveries/invalid/attempts", nil), map[string]string{"id": id})
+			handler.ListAttempts(response, req)
+			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request", "id query parameter is required")
+		})
+	}
+	t.Run("returns service error", func(t *testing.T) {
+		handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{
+			listAttempts: func(context.Context, string) ([]*domain.Attempt, error) {
+				return nil, errors.New("database unavailable")
+			},
+		})
+		response := httptest.NewRecorder()
+		req := mux.SetURLVars(httptest.NewRequest(http.MethodGet, "/deliveries/delivery-1/attempts", nil), map[string]string{"id": "delivery-1"})
+		handler.ListAttempts(response, req)
+		assertErrorResponse(t, response, http.StatusInternalServerError, "internal_error", "database unavailable")
+	})
 }
