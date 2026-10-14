@@ -247,6 +247,8 @@ func (r *Repository) ListAttempts(ctx context.Context, deliveryID string) ([]*do
 			&attempt.ResponseStatus,
 			&attempt.ErrorMessage,
 			&durationMS,
+			&attempt.ResponseBody,
+			&attempt.ResponseBodyTruncated,
 		); err != nil {
 			return nil, fmt.Errorf("scan delivery attempt: %w", err)
 		}
@@ -328,6 +330,8 @@ func (r *Repository) FinalizeAttempt(
 		sql.Named("response_status", input.Result.ResponseStatus),
 		sql.Named("error_message", input.ErrorMessage),
 		sql.Named("duration_ms", input.Result.Duration.Milliseconds()),
+		sql.Named("response_body", input.Result.ResponseBody),
+		sql.Named("response_body_truncated", input.Result.ResponseBodyTruncated),
 	)
 	if err != nil {
 		return fmt.Errorf("insert completed attempt: %w", err)

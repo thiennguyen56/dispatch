@@ -17,11 +17,13 @@ type InputSubmit struct {
 // SendResult describes one outbound attempt without assigning persistence IDs
 // or deciding whether the delivery should be retried.
 type SendResult struct {
-	StartedAt      time.Time
-	FinishedAt     time.Time
-	Duration       time.Duration
-	Outcome        domain.AttemptOutcome
-	ResponseStatus *int
+	StartedAt             time.Time
+	FinishedAt            time.Time
+	Duration              time.Duration
+	Outcome               domain.AttemptOutcome
+	ResponseStatus        *int
+	ResponseBody          *string
+	ResponseBodyTruncated bool
 }
 
 type FinalizeAttemptInput struct {

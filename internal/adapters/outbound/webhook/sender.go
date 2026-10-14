@@ -18,6 +18,7 @@ import (
 const (
 	defaultTimeout        = 10 * time.Second
 	maxResponseDrainBytes = 64 << 10
+	maxResponseBodyBytes  = 4 << 10
 )
 
 type Sender struct {
@@ -88,9 +89,30 @@ func (s *Sender) Send(ctx context.Context, delivery domain.Delivery) (result app
 		result.Outcome = domain.AttemptOutcomeSucceeded
 	}
 
-	// Best-effort bounded draining allows connection reuse for small replies.
-	// The client timeout also bounds body reads. Once headers acknowledge the
-	// attempt, a body read error must not turn a 2xx response into another send.
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseDrainBytes))
+	data, readErr := io.ReadAll(
+		io.LimitReader(response.Body, maxResponseBodyBytes+1),
+	)
+	result.ResponseBodyTruncated = len(data) > maxResponseBodyBytes
+	if result.ResponseBodyTruncated {
+		data = data[:maxResponseBodyBytes]
+	}
+	if len(data) > 0 || readErr == nil {
+		body := string(data)
+		result.ResponseBody = &body
+	}
+
+	if readErr != nil {
+		s.logger.WarnContext(ctx, "webhook response body read failed",
+			"delivery_id", delivery.ID,
+			"response_status", response.StatusCode,
+			"captured_bytes", len(data),
+		)
+	} else {
+		_, _ = io.Copy(
+			io.Discard,
+			io.LimitReader(response.Body, maxResponseDrainBytes),
+		)
+	}
+
 	return result, nil
 }

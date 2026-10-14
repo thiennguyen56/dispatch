@@ -38,7 +38,7 @@ func (p *Processor) ProcessNext(ctx context.Context) error {
 		"attempt_number", claim.AttemptsMade+1,
 	)
 	sent, err := p.sender.Send(ctx, *claim)
-	p.logger.Info("sent", "sent", sent)
+	p.logger.Info("sent", "outcome", sent.Outcome)
 
 	finalizeAttemptInput := FinalizeAttemptInput{
 		DeliveryID: claim.ID,

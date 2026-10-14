@@ -164,7 +164,9 @@ INSERT INTO delivery_attempts (
     outcome,
     response_status,
     error_message,
-    duration_ms
+    duration_ms,
+    response_body,
+    response_body_truncated
 ) VALUES (
     :delivery_id,
     :attempt_number,
@@ -173,7 +175,9 @@ INSERT INTO delivery_attempts (
     :outcome,
     :response_status,
     :error_message,
-    :duration_ms
+    :duration_ms,
+    :response_body,
+    :response_body_truncated
 )
 `
 
@@ -187,7 +191,9 @@ SELECT
     outcome,
     response_status,
     error_message,
-    duration_ms
+    duration_ms,
+    response_body,
+    response_body_truncated
 FROM delivery_attempts
 WHERE delivery_id = :delivery_id
 ORDER BY attempt_number DESC;

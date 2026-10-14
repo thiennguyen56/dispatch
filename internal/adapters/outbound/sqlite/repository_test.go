@@ -182,6 +182,7 @@ func TestServiceConcurrentSubmissionsReturnSameDelivery(t *testing.T) {
 	}
 	applyTestMigration(t, databases[0], "001_init.up.sql")
 	applyTestMigration(t, databases[0], "002_normalize_timestamps.up.sql")
+	applyTestMigration(t, databases[0], "003_add_attempt_response_body.up.sql")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	var lookups atomic.Int32
 	ready := make(chan struct{})
@@ -239,6 +240,7 @@ func openTestDB(t *testing.T) *sql.DB {
 
 	applyTestMigration(t, db, "001_init.up.sql")
 	applyTestMigration(t, db, "002_normalize_timestamps.up.sql")
+	applyTestMigration(t, db, "003_add_attempt_response_body.up.sql")
 	return db
 }
 
@@ -650,4 +652,55 @@ func TestRepositoryFinalizationOwnershipAndRollback(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAttemptResponseBodyMigration(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	applyTestMigration(t, db, "001_init.up.sql")
+	applyTestMigration(t, db, "002_normalize_timestamps.up.sql")
+	repo := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	delivery := testPendingDelivery("delivery-1", nil)
+	if err := repo.Create(context.Background(), delivery); err != nil {
+		t.Fatal(err)
+	}
+	insertTestAttempt(t, db, delivery.ID, 1, formatTime(delivery.CreatedAt), nil, nil, nil, nil, nil)
+	applyTestMigration(t, db, "003_add_attempt_response_body.up.sql")
+	var body sql.NullString
+	var truncated int
+	if err := db.QueryRow("SELECT response_body, response_body_truncated FROM delivery_attempts WHERE id = 1").Scan(&body, &truncated); err != nil {
+		t.Fatal(err)
+	}
+	if body.Valid || truncated != 0 {
+		t.Fatalf("existing row defaults: body=%+v truncated=%d", body, truncated)
+	}
+	response := `{"error":"missing order_id"}`
+	if _, err := db.Exec("UPDATE delivery_attempts SET response_body = ?, response_body_truncated = 1 WHERE id = 1", response); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT response_body, response_body_truncated FROM delivery_attempts WHERE id = 1").Scan(&body, &truncated); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Valid || body.String != response || truncated != 1 {
+		t.Fatalf("response round-trip: body=%+v truncated=%d", body, truncated)
+	}
+	for _, value := range []any{-1, 2, nil} {
+		if _, err := db.Exec("UPDATE delivery_attempts SET response_body_truncated = ? WHERE id = 1", value); err == nil {
+			t.Fatalf("accepted invalid truncation flag %v", value)
+		}
+	}
+	applyTestMigration(t, db, "003_add_attempt_response_body.down.sql")
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM delivery_attempts").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("rollback lost attempt: count=%d error=%v", count, err)
+	}
+	if _, err := db.Exec("SELECT response_body, response_body_truncated FROM delivery_attempts"); err == nil {
+		t.Fatal("rollback did not remove response columns")
+	}
+	// The schema remains upgradeable after rollback.
+	applyTestMigration(t, db, "003_add_attempt_response_body.up.sql")
 }

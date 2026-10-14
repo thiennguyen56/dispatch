@@ -231,7 +231,9 @@ func TestSendBoundsAndClosesResponseBody(t *testing.T) {
 	if err != nil || result.Outcome != domain.AttemptOutcomeSucceeded {
 		t.Fatalf("Send() = %+v, %v", result, err)
 	}
-	if !body.closed || body.read != maxResponseDrainBytes {
-		t.Errorf("body closed=%t, bytes read=%d", body.closed, body.read)
+	wantRead := maxResponseBodyBytes + 1 + maxResponseDrainBytes
+	if !body.closed || body.read != wantRead {
+		t.Errorf("body closed=%t, bytes read=%d, want=%d",
+			body.closed, body.read, wantRead)
 	}
 }
