@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,11 +21,12 @@ import (
 )
 
 type serviceStub struct {
-	listAttempts func(context.Context, string) ([]*domain.Attempt, error)
-	delivery     *domain.Delivery
-	submitErr    error
-	getErr       error
-	submit       func(context.Context, application.InputSubmit) (*domain.Delivery, error)
+	listDeliveries func(context.Context, application.ListDeliveriesQuery) (*application.DeliveryPage, error)
+	listAttempts   func(context.Context, string) ([]*domain.Attempt, error)
+	delivery       *domain.Delivery
+	submitErr      error
+	getErr         error
+	submit         func(context.Context, application.InputSubmit) (*domain.Delivery, error)
 }
 
 func (s serviceStub) Submit(ctx context.Context, input application.InputSubmit) (*domain.Delivery, error) {
@@ -296,4 +299,147 @@ func TestHandlerListAttempts(t *testing.T) {
 		handler.ListAttempts(response, req)
 		assertErrorResponse(t, response, http.StatusInternalServerError, "internal_error", "database unavailable")
 	})
+}
+
+func (s serviceStub) ListDeliveries(ctx context.Context, query application.ListDeliveriesQuery) (*application.DeliveryPage, error) {
+	if s.listDeliveries != nil {
+		return s.listDeliveries(ctx, query)
+	}
+	return &application.DeliveryPage{Deliveries: []*domain.Delivery{}}, nil
+}
+
+func TestHandlerListDeliveriesQuery(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, params, status, cursor string
+		limit                        uint
+	}{
+		{name: "defaults", limit: 20},
+		{name: "empty optional parameters", params: "?status=&limit=&cursor=", limit: 20},
+		{name: "pending", params: "?status=pending&limit=1", status: "pending", limit: 1},
+		{name: "in progress", params: "?status=in_progress", status: "in_progress", limit: 20},
+		{name: "delivered", params: "?status=delivered&limit=100", status: "delivered", limit: 100},
+		{name: "all parameters", params: "?status=dead_letter&limit=25&cursor=opaque-cursor", status: "dead_letter", limit: 25, cursor: "opaque-cursor"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/deliveries"+tc.params, nil)
+			calls := 0
+			handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{
+				listDeliveries: func(ctx context.Context, query application.ListDeliveriesQuery) (*application.DeliveryPage, error) {
+					calls++
+					if ctx != req.Context() || query.Limit != tc.limit || query.Cursor != nil {
+						t.Errorf("unexpected query or context: %+v", query)
+					}
+					if tc.status == "" {
+						if query.Status != nil {
+							t.Errorf("status=%v, want nil", query.Status)
+						}
+					} else if query.Status == nil || string(*query.Status) != tc.status {
+						t.Errorf("status=%v, want %q", query.Status, tc.status)
+					}
+					if tc.cursor == "" {
+						if query.CursorRaw != nil {
+							t.Errorf("cursor=%v, want nil", query.CursorRaw)
+						}
+					} else if query.CursorRaw == nil || *query.CursorRaw != tc.cursor {
+						t.Errorf("cursor=%v, want %q", query.CursorRaw, tc.cursor)
+					}
+					return &application.DeliveryPage{Deliveries: []*domain.Delivery{}}, nil
+				},
+			})
+			response := httptest.NewRecorder()
+			handler.ListDeliveries(response, req)
+			if response.Code != http.StatusOK || calls != 1 {
+				t.Fatalf("status=%d calls=%d body=%s", response.Code, calls, response.Body)
+			}
+		})
+	}
+	for _, params := range []string{"?status=unknown", "?status=PENDING", "?limit=0", "?limit=-1", "?limit=101", "?limit=abc", "?limit=1.5", "?limit=18446744073709551616"} {
+		t.Run("rejects "+params, func(t *testing.T) {
+			// A nil service ensures invalid input is rejected before delegation.
+			handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			response := httptest.NewRecorder()
+			handler.ListDeliveries(response, httptest.NewRequest(http.MethodGet, "/deliveries"+params, nil))
+			message := "limit must be an integer between 1 and 100"
+			if strings.HasPrefix(params, "?status") {
+				message = "status must be pending, in_progress, delivered, or dead_letter"
+			}
+			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request", message)
+		})
+	}
+	t.Run("service error", func(t *testing.T) {
+		handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{
+			listDeliveries: func(context.Context, application.ListDeliveriesQuery) (*application.DeliveryPage, error) {
+				return nil, errors.New("database unavailable")
+			},
+		})
+		response := httptest.NewRecorder()
+		handler.ListDeliveries(response, httptest.NewRequest(http.MethodGet, "/deliveries", nil))
+		assertErrorResponse(t, response, http.StatusInternalServerError, "internal_error", "database unavailable")
+	})
+}
+
+func TestHandlerListDeliveriesInvalidCursor(t *testing.T) {
+	t.Parallel()
+	for _, err := range []error{application.ErrInvalidCursor, fmt.Errorf("decode cursor: %w", application.ErrInvalidCursor)} {
+		t.Run(err.Error(), func(t *testing.T) {
+			handler := NewHandler(slog.New(slog.NewTextHandler(io.Discard, nil)), serviceStub{
+				listDeliveries: func(context.Context, application.ListDeliveriesQuery) (*application.DeliveryPage, error) {
+					return nil, err
+				},
+			})
+			response := httptest.NewRecorder()
+			handler.ListDeliveries(response, httptest.NewRequest(http.MethodGet, "/deliveries?cursor=bad", nil))
+			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request", "invalid cursor")
+		})
+	}
+}
+
+func TestHandlerListDeliveriesSummary(t *testing.T) {
+	t.Parallel()
+	token, key := "secret-lease", "secret-key"
+	expires := time.Now().UTC()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, empty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("empty=%t", empty), func(t *testing.T) {
+			page := &application.DeliveryPage{NextCursor: "next-page"}
+			if !empty {
+				page.Deliveries = []*domain.Delivery{{ID: "delivery-1", URL: "https://example.com/hook", Payload: "private-payload",
+					Headers: map[string]string{"Authorization": "Bearer secret"}, LeaseToken: &token, LeaseExpiresAt: &expires,
+					IdempotencyKey: &key, Status: domain.DeliveryStatusPending, MaxAttempts: 8}}
+			}
+			handler := NewHandler(logger, serviceStub{listDeliveries: func(context.Context, application.ListDeliveriesQuery) (*application.DeliveryPage, error) {
+				return page, nil
+			}})
+			response := httptest.NewRecorder()
+			handler.ListDeliveries(response, httptest.NewRequest(http.MethodGet, "/deliveries", nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d", response.Code)
+			}
+			var body struct {
+				Deliveries []map[string]json.RawMessage `json:"deliveries"`
+				NextCursor string                       `json:"next_cursor"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Deliveries == nil || body.NextCursor != page.NextCursor {
+				t.Fatalf("invalid response: %+v", body)
+			}
+			if empty {
+				if len(body.Deliveries) != 0 {
+					t.Fatal("expected empty array")
+				}
+				return
+			}
+			if len(body.Deliveries) != 1 || string(body.Deliveries[0]["id"]) != `"delivery-1"` || string(body.Deliveries[0]["status"]) != `"pending"` {
+				t.Fatalf("invalid summary: %+v", body)
+			}
+			for _, field := range []string{"headers", "payload", "lease_token", "lease_expires_at", "idempotency_key"} {
+				if _, exists := body.Deliveries[0][field]; exists {
+					t.Errorf("private field %q exposed", field)
+				}
+			}
+		})
+	}
 }

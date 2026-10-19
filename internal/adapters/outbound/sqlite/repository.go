@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -218,7 +219,74 @@ func (r *Repository) ListDeliveries(
 	ctx context.Context,
 	query application.ListDeliveriesQuery,
 ) (*application.DeliveryPage, error) {
-	return nil, nil
+	fetchLimit := query.Limit + 1
+	rows, err := r.db.QueryContext(ctx,
+		listDeliveries,
+		sql.Named("status", query.Status),
+		sql.Named("fetch_limit", fetchLimit),
+		sql.Named("cursor_created_at", query.GetCursor().GetCreatedAt()),
+		sql.Named("cursor_id", query.GetCursor().GetID()))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	deliveries := make([]*domain.Delivery, 0, query.Limit)
+	for rows.Next() {
+		var delRow deliveryRow
+		if err := rows.Scan(
+			&delRow.ID,
+			&delRow.URL,
+			&delRow.Payload,
+			&delRow.HeadersJSON,
+			&delRow.Status,
+			&delRow.AttemptsMade,
+			&delRow.MaxAttempts,
+			&delRow.NextAttemptAt,
+			&delRow.LeaseToken,
+			&delRow.LeaseExpiresAt,
+			&delRow.LastError,
+			&delRow.IdempotencyKey,
+			&delRow.CreatedAt,
+			&delRow.UpdatedAt,
+			&delRow.DeliveredAt,
+		); err != nil {
+			return nil, err
+		}
+
+		delivery, err := delRow.toDomain()
+		if err != nil {
+			return nil, err
+		}
+		deliveries = append(deliveries, delivery)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate deliveries: %w", err)
+	}
+	hasMore := len(deliveries) > int(query.Limit)
+	if hasMore {
+		deliveries = deliveries[:query.Limit]
+	}
+	var nextCursor string
+	if hasMore {
+		last := deliveries[len(deliveries)-1]
+		lastCreatedAt := formatTime(last.CreatedAt)
+		data, err := json.Marshal(application.Cursor{
+			CreatedAt: &lastCreatedAt,
+			ID:        &last.ID,
+			Status:    query.Status,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("encode cursor: %w", err)
+		}
+
+		nextCursor = base64.RawURLEncoding.EncodeToString(data)
+	}
+
+	return &application.DeliveryPage{
+		Deliveries: deliveries,
+		NextCursor: nextCursor,
+	}, nil
 }
 
 func (r *Repository) ListAttempts(ctx context.Context, deliveryID string) ([]*domain.Attempt, error) {

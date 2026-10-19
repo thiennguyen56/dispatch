@@ -3,6 +3,8 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -703,4 +705,116 @@ func TestAttemptResponseBodyMigration(t *testing.T) {
 	}
 	// The schema remains upgradeable after rollback.
 	applyTestMigration(t, db, "003_add_attempt_response_body.up.sql")
+}
+
+func TestListDeliveriesPagination(t *testing.T) {
+	db := openTestDB(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	repo := NewRepository(db, logger)
+	service := application.NewService(logger, repo)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	base := time.Date(2026, 10, 19, 8, 0, 0, 123456789, time.UTC)
+	for _, item := range []struct {
+		id     string
+		offset time.Duration
+		status domain.DeliveryStatus
+	}{
+		{"b", 0, domain.DeliveryStatusPending},
+		{"e", time.Second, domain.DeliveryStatusDelivered},
+		{"a", -time.Second, domain.DeliveryStatusPending},
+		{"f", 0, domain.DeliveryStatusPending},
+		{"d", 0, domain.DeliveryStatusPending},
+	} {
+		delivery := testPendingDelivery(item.id, nil)
+		delivery.CreatedAt = base.Add(item.offset)
+		delivery.UpdatedAt = delivery.CreatedAt
+		delivery.Status = item.status
+		if err := repo.Create(ctx, delivery); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, delivered, dead := domain.DeliveryStatusPending, domain.DeliveryStatusDelivered, domain.DeliveryStatusDeadLetter
+	for _, tc := range []struct {
+		name   string
+		status *domain.DeliveryStatus
+		limit  uint
+		want   []string
+		pages  int
+	}{
+		{name: "multiple pages with timestamp ties", limit: 2, want: []string{"e", "f", "d", "b", "a"}, pages: 3},
+		{name: "single item pages", limit: 1, want: []string{"e", "f", "d", "b", "a"}, pages: 5},
+		{name: "exact full final page with filter", status: &pending, limit: 2, want: []string{"f", "d", "b", "a"}, pages: 2},
+		{name: "single result", status: &delivered, limit: 2, want: []string{"e"}, pages: 1},
+		{name: "empty filter", status: &dead, limit: 2, want: []string{}, pages: 1},
+		{name: "all in one page", limit: 100, want: []string{"e", "f", "d", "b", "a"}, pages: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := []string{}
+			query := application.ListDeliveriesQuery{Status: tc.status, Limit: tc.limit}
+			pages := 0
+			for {
+				pages++
+				if pages > len(tc.want)+1 {
+					t.Fatal("pagination did not terminate")
+				}
+				page, err := service.ListDeliveries(ctx, query)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if page.Deliveries == nil || len(page.Deliveries) > int(tc.limit) {
+					t.Fatalf("invalid page: %+v", page)
+				}
+				for _, delivery := range page.Deliveries {
+					ids = append(ids, delivery.ID)
+					if tc.status != nil && delivery.Status != *tc.status {
+						t.Fatalf("wrong filtered status: %s", delivery.Status)
+					}
+				}
+				if page.NextCursor == "" {
+					break
+				}
+				if len(page.Deliveries) != int(tc.limit) {
+					t.Fatal("cursor on incomplete page")
+				}
+				data, err := base64.RawURLEncoding.DecodeString(page.NextCursor)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var cursor application.Cursor
+				if err := json.Unmarshal(data, &cursor); err != nil {
+					t.Fatal(err)
+				}
+				last := page.Deliveries[len(page.Deliveries)-1]
+				if cursor.ID == nil || *cursor.ID != last.ID || cursor.CreatedAt == nil || *cursor.CreatedAt != formatTime(last.CreatedAt) || !reflect.DeepEqual(cursor.Status, tc.status) {
+					t.Fatalf("cursor is not last returned row: %+v", cursor)
+				}
+				next := page.NextCursor
+				query.CursorRaw = &next
+			}
+			if !reflect.DeepEqual(ids, tc.want) || pages != tc.pages {
+				t.Fatalf("IDs=%v pages=%d, want %v / %d", ids, pages, tc.want, tc.pages)
+			}
+		})
+	}
+	t.Run("cancellation", func(t *testing.T) {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		got, err := service.ListDeliveries(canceled, application.ListDeliveriesQuery{Limit: 2})
+		if got != nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("page=%+v error=%v", got, err)
+		}
+	})
+}
+
+func TestListDeliveriesEmptyDatabase(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := application.NewService(logger, NewRepository(openTestDB(t), logger))
+	page, err := service.ListDeliveries(context.Background(), application.ListDeliveriesQuery{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Deliveries == nil || len(page.Deliveries) != 0 || page.NextCursor != "" {
+		t.Fatalf("invalid empty page: %+v", page)
+	}
 }

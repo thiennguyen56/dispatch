@@ -3,8 +3,10 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -16,6 +18,7 @@ type Service interface {
 	Submit(ctx context.Context, input application.InputSubmit) (*domain.Delivery, error)
 	Get(ctx context.Context, id string) (*domain.Delivery, error)
 	ListAttempts(ctx context.Context, deliveryID string) ([]*domain.Attempt, error)
+	ListDeliveries(ctx context.Context, query application.ListDeliveriesQuery) (*application.DeliveryPage, error)
 }
 
 type Handler struct {
@@ -79,7 +82,47 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListDeliveries(w http.ResponseWriter, r *http.Request) {
-	panic("not implemented")
+	params := r.URL.Query()
+	query := application.ListDeliveriesQuery{Limit: 20}
+
+	if rawStatus := params.Get("status"); rawStatus != "" {
+		status := domain.DeliveryStatus(rawStatus)
+		switch status {
+		case domain.DeliveryStatusPending, domain.DeliveryStatusInProgress,
+			domain.DeliveryStatusDelivered, domain.DeliveryStatusDeadLetter:
+			query.Status = &status
+		default:
+			writeError(w, http.StatusBadRequest, "invalid_request",
+				"status must be pending, in_progress, delivered, or dead_letter")
+			return
+		}
+	}
+
+	if rawLimit := params.Get("limit"); rawLimit != "" {
+		limit, err := strconv.ParseUint(rawLimit, 10, 32)
+		if err != nil || limit < 1 || limit > 100 {
+			writeError(w, http.StatusBadRequest, "invalid_request",
+				"limit must be an integer between 1 and 100")
+			return
+		}
+		query.Limit = uint(limit)
+	}
+
+	if cursor := params.Get("cursor"); cursor != "" {
+		query.CursorRaw = &cursor
+	}
+	deliveries, err := h.service.ListDeliveries(r.Context(), query)
+	if err != nil {
+		if errors.Is(err, application.ErrInvalidCursor) {
+			writeError(w, http.StatusBadRequest, "invalid_request", "invalid cursor")
+			return
+		}
+		h.logger.Error("failed to list deliveries", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, newDeliveryPageResponse(deliveries))
 }
 
 func (h *Handler) ListAttempts(w http.ResponseWriter, r *http.Request) {

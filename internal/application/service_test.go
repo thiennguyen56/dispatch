@@ -3,6 +3,8 @@ package application
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,15 +19,16 @@ import (
 )
 
 type repositoryStub struct {
-	claim        func(context.Context, time.Time, time.Duration) (*domain.Delivery, error)
-	finalize     func(context.Context, FinalizeAttemptInput, time.Time) error
-	listAttempts func(context.Context, string) ([]*domain.Attempt, error)
-	created      domain.Delivery
-	createErr    error
-	getDelivery  *domain.Delivery
-	getErr       error
-	createCalls  int
-	lookup       func(context.Context, string) (*domain.Delivery, error)
+	listDeliveries func(context.Context, ListDeliveriesQuery) (*DeliveryPage, error)
+	claim          func(context.Context, time.Time, time.Duration) (*domain.Delivery, error)
+	finalize       func(context.Context, FinalizeAttemptInput, time.Time) error
+	listAttempts   func(context.Context, string) ([]*domain.Attempt, error)
+	created        domain.Delivery
+	createErr      error
+	getDelivery    *domain.Delivery
+	getErr         error
+	createCalls    int
+	lookup         func(context.Context, string) (*domain.Delivery, error)
 }
 
 func (r *repositoryStub) Create(_ context.Context, delivery domain.Delivery) error {
@@ -45,7 +48,10 @@ func (r *repositoryStub) Get(context.Context, string) (*domain.Delivery, error) 
 	return r.getDelivery, r.getErr
 }
 
-func (r *repositoryStub) ListDeliveries(_ context.Context, _ ListDeliveriesQuery) (*DeliveryPage, error) {
+func (r *repositoryStub) ListDeliveries(ctx context.Context, query ListDeliveriesQuery) (*DeliveryPage, error) {
+	if r.listDeliveries != nil {
+		return r.listDeliveries(ctx, query)
+	}
 	return nil, nil
 }
 
@@ -427,6 +433,120 @@ func TestProcessorPropagatesRepositoryErrors(t *testing.T) {
 			}
 			if tc.claimErr == nil && (sends != 1 || finalizations != 1) {
 				t.Fatalf("sends=%d finalizations=%d", sends, finalizations)
+			}
+		})
+	}
+}
+
+func TestServiceListDeliveriesInvalidCursor(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, raw string }{
+		{"invalid base64", "%%%"},
+		{"invalid JSON", base64.RawURLEncoding.EncodeToString([]byte("{"))},
+		{"wrong JSON type", base64.RawURLEncoding.EncodeToString([]byte("[]"))},
+		{"null cursor", base64.RawURLEncoding.EncodeToString([]byte("null"))},
+		{"empty object", base64.RawURLEncoding.EncodeToString([]byte(`{}`))},
+		{"missing ID", base64.RawURLEncoding.EncodeToString([]byte(`{"CreatedAt":"2026-10-19T08:00:00Z"}`))},
+		{"empty ID", base64.RawURLEncoding.EncodeToString([]byte(`{"ID":"  ","CreatedAt":"2026-10-19T08:00:00Z"}`))},
+		{"missing creation time", base64.RawURLEncoding.EncodeToString([]byte(`{"ID":"delivery-1"}`))},
+		{"invalid creation time", base64.RawURLEncoding.EncodeToString([]byte(`{"ID":"delivery-1","CreatedAt":"yesterday"}`))},
+		{"zero creation time", base64.RawURLEncoding.EncodeToString([]byte(`{"ID":"delivery-1","CreatedAt":"0001-01-01T00:00:00Z"}`))},
+		{"invalid status", base64.RawURLEncoding.EncodeToString([]byte(`{"ID":"delivery-1","CreatedAt":"2026-10-19T08:00:00Z","status":"unknown"}`))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &repositoryStub{listDeliveries: func(context.Context, ListDeliveriesQuery) (*DeliveryPage, error) {
+				t.Fatal("invalid cursor reached repository")
+				return nil, nil
+			}}
+			service := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)), repo)
+			page, err := service.ListDeliveries(context.Background(), ListDeliveriesQuery{Limit: 20, CursorRaw: &tc.raw})
+			if page != nil || !errors.Is(err, ErrInvalidCursor) {
+				t.Fatalf("page=%+v error=%v, want ErrInvalidCursor", page, err)
+			}
+		})
+	}
+}
+
+func TestServiceListDeliveriesCursorForwarding(t *testing.T) {
+	t.Parallel()
+	failure := errors.New("database unavailable")
+	for _, tc := range []struct {
+		name    string
+		raw     *string
+		repoErr error
+	}{
+		{name: "first page"},
+		{name: "valid cursor", raw: func() *string {
+			s := base64.RawURLEncoding.EncodeToString([]byte(`{"ID":"delivery-1","CreatedAt":"2026-10-19T08:00:00.000000000Z","status":null}`))
+			return &s
+		}()},
+		{name: "repository failure", repoErr: failure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := &DeliveryPage{Deliveries: []*domain.Delivery{}}
+			calls := 0
+			repo := &repositoryStub{listDeliveries: func(_ context.Context, query ListDeliveriesQuery) (*DeliveryPage, error) {
+				calls++
+				if tc.raw != nil && (query.Cursor == nil || query.Cursor.ID == nil || *query.Cursor.ID != "delivery-1") {
+					t.Errorf("cursor not decoded: %+v", query.Cursor)
+				}
+				if tc.repoErr != nil {
+					return nil, tc.repoErr
+				}
+				return want, nil
+			}}
+			service := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)), repo)
+			got, err := service.ListDeliveries(context.Background(), ListDeliveriesQuery{Limit: 20, CursorRaw: tc.raw})
+			if calls != 1 || !errors.Is(err, tc.repoErr) || errors.Is(err, ErrInvalidCursor) {
+				t.Fatalf("calls=%d error=%v", calls, err)
+			}
+			if tc.repoErr == nil && got != want {
+				t.Fatalf("page=%+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestServiceListDeliveriesCursorFilterAndTime(t *testing.T) {
+	t.Parallel()
+	pending, delivered := domain.DeliveryStatusPending, domain.DeliveryStatusDelivered
+	for _, tc := range []struct {
+		name                      string
+		cursorStatus, queryStatus *domain.DeliveryStatus
+		invalid                   bool
+	}{
+		{name: "unfiltered"},
+		{name: "same filter", cursorStatus: &pending, queryStatus: &pending},
+		{name: "changed filter", cursorStatus: &pending, queryStatus: &delivered, invalid: true},
+		{name: "removed filter", cursorStatus: &pending, invalid: true},
+		{name: "added filter", queryStatus: &pending, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, createdAt := "delivery-1", "2026-10-19T10:00:00.123+02:00"
+			data, err := json.Marshal(Cursor{ID: &id, CreatedAt: &createdAt, Status: tc.cursorStatus})
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw := base64.RawURLEncoding.EncodeToString(data)
+			calls := 0
+			repo := &repositoryStub{listDeliveries: func(_ context.Context, query ListDeliveriesQuery) (*DeliveryPage, error) {
+				calls++
+				if query.Cursor == nil || query.Cursor.CreatedAt == nil || *query.Cursor.CreatedAt != "2026-10-19T08:00:00.123000000Z" {
+					t.Errorf("timestamp not normalized: %+v", query.Cursor)
+				}
+				if !reflect.DeepEqual(query.Status, tc.queryStatus) {
+					t.Errorf("query filter changed: %v", query.Status)
+				}
+				return &DeliveryPage{Deliveries: []*domain.Delivery{}}, nil
+			}}
+			service := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)), repo)
+			got, err := service.ListDeliveries(context.Background(), ListDeliveriesQuery{Limit: 2, Status: tc.queryStatus, CursorRaw: &raw})
+			if tc.invalid {
+				if !errors.Is(err, ErrInvalidCursor) || got != nil || calls != 0 {
+					t.Fatalf("page=%+v error=%v calls=%d", got, err, calls)
+				}
+			} else if err != nil || got == nil || calls != 1 {
+				t.Fatalf("page=%+v error=%v calls=%d", got, err, calls)
 			}
 		})
 	}

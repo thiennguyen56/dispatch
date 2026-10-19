@@ -3,9 +3,13 @@ package application
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -77,4 +81,71 @@ func (s *Service) ListAttempts(ctx context.Context, deliveryID string) ([]*domai
 	}
 
 	return attempts, nil
+}
+
+func (s *Service) ListDeliveries(ctx context.Context, query ListDeliveriesQuery) (*DeliveryPage, error) {
+	if query.Limit == 0 || query.Limit > 100 {
+		query.Limit = 20
+	}
+
+	if query.CursorRaw != nil && *query.CursorRaw != "" {
+		cursor, err := decodeCursor(*query.CursorRaw)
+		if err != nil {
+			return nil, err
+		}
+		query.Cursor = cursor
+	}
+	if query.Cursor != nil {
+		cursor, err := query.Cursor.normalize(query.Status)
+		if err != nil {
+			return nil, err
+		}
+		query.Cursor = cursor
+	}
+
+	return s.repo.ListDeliveries(ctx, query)
+}
+
+func decodeCursor(raw string) (*Cursor, error) {
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decode base64: %v", ErrInvalidCursor, err)
+	}
+	var cursor *Cursor
+	if err := json.Unmarshal(data, &cursor); err != nil {
+		return nil, fmt.Errorf("%w: decode JSON: %v", ErrInvalidCursor, err)
+	}
+	if cursor == nil {
+		return nil, ErrInvalidCursor
+	}
+	return cursor, nil
+}
+
+// normalize validates the page boundary and returns a copy suitable for SQLite.
+func (c *Cursor) normalize(status *domain.DeliveryStatus) (*Cursor, error) {
+	if c.ID == nil || strings.TrimSpace(*c.ID) == "" || c.CreatedAt == nil {
+		return nil, ErrInvalidCursor
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, *c.CreatedAt)
+	if err != nil || createdAt.IsZero() {
+		return nil, fmt.Errorf("%w: invalid creation time", ErrInvalidCursor)
+	}
+	if c.Status != nil {
+		switch *c.Status {
+		case domain.DeliveryStatusPending, domain.DeliveryStatusInProgress,
+			domain.DeliveryStatusDelivered, domain.DeliveryStatusDeadLetter:
+		default:
+			return nil, fmt.Errorf("%w: invalid status", ErrInvalidCursor)
+		}
+	}
+	// A cursor belongs to the same filter that produced it, including no filter.
+	if (c.Status == nil) != (status == nil) {
+		return nil, fmt.Errorf("%w: status filter changed", ErrInvalidCursor)
+	}
+	if c.Status != nil && *c.Status != *status {
+		return nil, fmt.Errorf("%w: status filter changed", ErrInvalidCursor)
+	}
+	// SQLite compares fixed-width UTC timestamp strings.
+	normalized := createdAt.UTC().Format("2006-01-02T15:04:05.000000000Z")
+	return &Cursor{ID: c.ID, CreatedAt: &normalized, Status: c.Status}, nil
 }

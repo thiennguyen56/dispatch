@@ -198,3 +198,30 @@ FROM delivery_attempts
 WHERE delivery_id = :delivery_id
 ORDER BY attempt_number DESC;
 `
+
+const listDeliveries = `
+SELECT
+    id,
+    target_url,
+    payload,
+    headers_json,
+    status,
+    attempts_made,
+    max_attempts,
+    next_attempt_at,
+    lease_token,
+    lease_expires_at,
+    last_error,
+    idempotency_key,
+    created_at,
+    updated_at,
+    delivered_at
+FROM deliveries
+WHERE (:status IS NULL OR status = :status)
+  AND (
+      :cursor_created_at IS NULL
+      OR (created_at, id) < (:cursor_created_at, :cursor_id)
+  )
+ORDER BY created_at DESC, id DESC
+LIMIT :fetch_limit;
+`

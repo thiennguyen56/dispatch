@@ -85,12 +85,37 @@ func (input FinalizeAttemptInput) Validate() error {
 }
 
 type ListDeliveriesQuery struct {
-	Status *domain.DeliveryStatus
-	Limit  uint
-	Cursor string
+	Status    *domain.DeliveryStatus `json:"status"`
+	Limit     uint                   `json:"limit"`
+	Cursor    *Cursor                `json:"cursor"`
+	CursorRaw *string
+}
+
+func (l *ListDeliveriesQuery) GetCursor() *Cursor {
+	return l.Cursor
+}
+
+type Cursor struct {
+	ID        *string
+	CreatedAt *string
+	Status    *domain.DeliveryStatus `json:"status"`
+}
+
+func (c *Cursor) GetID() *string {
+	if c == nil {
+		return nil
+	}
+	return c.ID
+}
+
+func (c *Cursor) GetCreatedAt() *string {
+	if c == nil {
+		return nil
+	}
+	return c.CreatedAt
 }
 
 type DeliveryPage struct {
-	Deliveries []domain.Delivery
-	NextCursor string
+	Deliveries []*domain.Delivery `json:"deliveries"`
+	NextCursor string             `json:"next_cursor"`
 }
