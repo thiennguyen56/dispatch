@@ -1,0 +1,2 @@
+DROP INDEX deliveries_status_created_id_idx;
+DROP INDEX deliveries_created_id_idx;

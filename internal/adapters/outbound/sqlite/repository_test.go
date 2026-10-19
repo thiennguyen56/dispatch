@@ -185,6 +185,7 @@ func TestServiceConcurrentSubmissionsReturnSameDelivery(t *testing.T) {
 	applyTestMigration(t, databases[0], "001_init.up.sql")
 	applyTestMigration(t, databases[0], "002_normalize_timestamps.up.sql")
 	applyTestMigration(t, databases[0], "003_add_attempt_response_body.up.sql")
+	applyTestMigration(t, databases[0], "004_add_delivery_listing_indexes.up.sql")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	var lookups atomic.Int32
 	ready := make(chan struct{})
@@ -243,6 +244,7 @@ func openTestDB(t *testing.T) *sql.DB {
 	applyTestMigration(t, db, "001_init.up.sql")
 	applyTestMigration(t, db, "002_normalize_timestamps.up.sql")
 	applyTestMigration(t, db, "003_add_attempt_response_body.up.sql")
+	applyTestMigration(t, db, "004_add_delivery_listing_indexes.up.sql")
 	return db
 }
 
@@ -816,5 +818,138 @@ func TestListDeliveriesEmptyDatabase(t *testing.T) {
 	}
 	if page.Deliveries == nil || len(page.Deliveries) != 0 || page.NextCursor != "" {
 		t.Fatalf("invalid empty page: %+v", page)
+	}
+}
+
+func TestMigrateFreshDatabaseAndRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dispatch.db")
+	open := func() *sql.DB {
+		t.Helper()
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return db
+	}
+	db := open()
+	if err := Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	repo := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	delivery := testPendingDelivery("survives-restart", nil)
+	if err := repo.Create(context.Background(), delivery); err != nil {
+		t.Fatalf("database unusable after migration: %v", err)
+	}
+	insertTestAttempt(t, db, delivery.ID, 1, formatTime(delivery.CreatedAt), nil, nil, nil, nil, nil)
+	// No pending migration is a successful no-op.
+	if err := Migrate(db); err != nil {
+		t.Fatalf("repeat migration: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = open()
+	if err := Migrate(db); err != nil {
+		t.Fatalf("restart migration: %v", err)
+	}
+	repo = NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	got, err := repo.Get(context.Background(), delivery.ID)
+	if err != nil || !reflect.DeepEqual(got, &delivery) {
+		t.Fatalf("delivery lost on restart: %+v, %v", got, err)
+	}
+	attempts, err := repo.ListAttempts(context.Background(), delivery.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].ResponseBody != nil || attempts[0].ResponseBodyTruncated {
+		t.Fatalf("attempt history lost on restart: %+v, %v", attempts, err)
+	}
+	var version int
+	var dirty bool
+	if err := db.QueryRow("SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty); err != nil || version != 4 || dirty {
+		t.Fatalf("version=%d dirty=%t error=%v", version, dirty, err)
+	}
+	var indexes int
+	if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('deliveries_created_id_idx', 'deliveries_status_created_id_idx')").Scan(&indexes); err != nil || indexes != 2 {
+		t.Fatalf("listing indexes=%d error=%v", indexes, err)
+	}
+}
+
+func TestMigrateExistingCLIDatabase(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "dispatch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, name := range []string{"001_init.up.sql", "002_normalize_timestamps.up.sql", "003_add_attempt_response_body.up.sql"} {
+		applyTestMigration(t, db, name)
+	}
+	// Match the version table used by the golang-migrate CLI.
+	if _, err := db.Exec(`CREATE TABLE schema_migrations (version uint64, dirty bool);
+ CREATE UNIQUE INDEX version_unique ON schema_migrations(version);
+ INSERT INTO schema_migrations VALUES (3, false);`); err != nil {
+		t.Fatal(err)
+	}
+	repo := NewRepository(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	delivery := testPendingDelivery("existing-delivery", nil)
+	if err := repo.Create(context.Background(), delivery); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(db); err != nil {
+		t.Fatalf("upgrade from CLI-managed schema: %v", err)
+	}
+	got, err := repo.Get(context.Background(), delivery.ID)
+	if err != nil || !reflect.DeepEqual(got, &delivery) {
+		t.Fatalf("upgrade changed delivery: %+v, %v", got, err)
+	}
+	var version int
+	if err := db.QueryRow("SELECT version FROM schema_migrations").Scan(&version); err != nil || version != 4 {
+		t.Fatalf("version=%d error=%v", version, err)
+	}
+}
+
+func TestMigrateRejectsUnusableSchema(t *testing.T) {
+	for _, mode := range []string{"dirty schema", "newer schema", "migration failure"} {
+		t.Run(mode, func(t *testing.T) {
+			db, err := sql.Open("sqlite", ":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			if mode == "migration failure" {
+				if _, err := db.Exec("CREATE TABLE deliveries (id TEXT PRIMARY KEY); INSERT INTO deliveries VALUES ('preserve-me')"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				version, dirty := 3, true
+				if mode == "newer schema" {
+					version, dirty = 99, false
+				}
+				if _, err := db.Exec("CREATE TABLE schema_migrations (version uint64, dirty bool)"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.Exec("INSERT INTO schema_migrations VALUES (?, ?)", version, dirty); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := Migrate(db); err == nil {
+				t.Fatal("expected startup migration failure")
+			}
+			if err := db.Ping(); err != nil {
+				t.Fatalf("migration closed caller database: %v", err)
+			}
+			if mode == "migration failure" {
+				var id string
+				if err := db.QueryRow("SELECT id FROM deliveries").Scan(&id); err != nil || id != "preserve-me" {
+					t.Fatalf("existing data changed: %q, %v", id, err)
+				}
+				var dirty bool
+				if err := db.QueryRow("SELECT dirty FROM schema_migrations").Scan(&dirty); err != nil || !dirty {
+					t.Fatalf("failed migration not marked dirty: %t, %v", dirty, err)
+				}
+				if err := Migrate(db); err == nil {
+					t.Fatal("retry should reject dirty migration")
+				}
+			}
+		})
 	}
 }

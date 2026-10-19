@@ -6,6 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . ./
+# SQL migrations are embedded in the binary and applied at startup.
 RUN CGO_ENABLED=0 go build -o /dispatch ./cmd/dispatch
 
 FROM alpine:3.20

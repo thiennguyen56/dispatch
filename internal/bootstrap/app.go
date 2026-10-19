@@ -58,6 +58,11 @@ func (a *App) Run() error {
 		return fmt.Errorf("connect to database %q: %w", dbPath, err)
 	}
 	log.Info("database connected", "path", dbPath)
+	if err := sqlite.Migrate(db); err != nil {
+		_ = db.Close()
+		return fmt.Errorf("migrate database %q: %w", dbPath, err)
+	}
+	log.Info("database migrations complete", "path", dbPath)
 	repo := sqlite.NewRepository(db, log)
 	service := application.NewService(log, repo)
 	sender := webhook.NewSender(log)

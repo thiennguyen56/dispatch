@@ -1,27 +1,27 @@
 # Dispatch
 
 Dispatch is a Go HTTP service that accepts webhook delivery requests, stores
-them in SQLite, and retrieves them by ID. It currently persists deliveries; a
-background delivery processing and retries are not wired into the application yet.
+them in SQLite, and sends them through a background worker with retries and
+attempt history.
 
 ## Requirements
 
-- Go 1.25 or later
-- `golang-migrate`, built with the `sqlite` driver, for schema migrations
+- Go 1.25.11 or later
+- Optional: `golang-migrate`, built with the `sqlite` driver, for manual migration administration
 
-Install the migration CLI once:
+To use the optional migration CLI:
 
 ```bash
-go install -tags 'sqlite' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+go install -tags 'sqlite' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.20.1
 ```
 
 ## Run locally
 
-Apply the migrations before starting the application. Both commands use
-`dispatch.db` in the repository root by default.
+The application applies embedded SQL migrations before starting the API and
+worker. It opens `dispatch.db` in the repository root by default; set
+`DISPATCH_DB_PATH` to use a different file.
 
 ```bash
-make migrate-up
 go run ./cmd/dispatch
 ```
 
@@ -85,10 +85,17 @@ connecting to a separate database service. The initial schema defines:
 
 - `deliveries`: a durable webhook request, retry state, idempotency key, and
   lease metadata.
-- `delivery_attempts`: the future audit record for each outbound HTTP attempt.
+- `delivery_attempts`: the audit record for each outbound HTTP attempt.
 - `schema_migrations`: managed by `golang-migrate`.
 
-Migration files are in `internal/adapters/outbound/sqlite/migration/`.
+Migration files are in `internal/adapters/outbound/sqlite/migration/` and embedded
+into the binary. Startup applies pending migrations to the same database
+connection used by the service. Completed migrations are tracked in
+`schema_migrations`, so restarting preserves data and skips completed work.
+A failed or dirty migration prevents the API and worker from starting. A schema
+version newer than the binary also fails startup; migrations never downgrade
+automatically. Stop other instances before starting an upgrade: this workflow
+is for a single application instance, not concurrent migration runners.
 
 Database timestamps use UTC with exactly nine fractional digits so text
 comparisons match chronological order. Migration `002` normalizes existing
@@ -112,26 +119,46 @@ make migrate-up DB_PATH=tmp/test.db
 
 ## Docker Compose
 
-`compose.yaml` builds and runs the HTTP service on port `8080`, using the
-`dispatch-sqlite` named volume for database storage. Configuration loads `.env`
-locally and preserves existing environment variables. Compose passes `.env`
-variables into the container and overrides `DISPATCH_DB_PATH` with
-`/var/lib/dispatch/dispatch.db`. Create a local `.env` file before using Compose.
+`compose.yaml` builds and runs the service on port `8080`. It bind-mounts
+`./data` to `/var/lib/dispatch`, so the local file `data/dispatch.db` is the
+container's `/var/lib/dispatch/dispatch.db`.
 
-Bootstrap creates the database directory and verifies the connection before
-starting workers. The image creates `/var/lib/dispatch` owned by the `dispatch`
-user. Existing volumes may need their ownership corrected once:
+Configuration loads `.env` locally and preserves existing environment variables.
+Compose passes `.env` into the container and sets `DISPATCH_DB_PATH` to the mounted
+path. For a fresh install:
 
 ```bash
+touch .env
+mkdir -p data
 podman compose build
 podman compose run --rm --no-deps --user root --entrypoint chown dispatch -R dispatch:dispatch /var/lib/dispatch
-make compose-up RECREATE=1
+make compose-up
 ```
 
-The database inside the named volume must also have the schema migrations
-applied. The runtime image does not currently include a migration runner;
-running `make migrate-up` on the host updates the host database, not the named
-volume database. Automatic container schema initialization remains to be added.
+The ownership command grants the image's non-root `dispatch` user access to the
+mounted directory. It changes ownership of the host `data` directory as well.
+Use `docker compose` instead when using Docker.
+
+No separate migration container or host CLI is required. SQL files ship inside
+the binary and run when the container starts, after the mount is available and
+before the API and worker start. Startup failures appear in the container logs.
+If using the optional CLI manually, target this same file:
+
+```bash
+make migrate-version DB_PATH=data/dispatch.db
+```
+
+For upgrades, stop Dispatch first, back up the database with SQLite's backup
+command, then rebuild and restart:
+
+```bash
+podman compose stop dispatch
+sqlite3 data/dispatch.db ".backup 'data/dispatch-backup.db'"
+make compose-up BUILD=1 RECREATE=1
+```
+
+Keep the backup until the upgrade is verified. Do not reset a dirty migration
+version automatically; investigate the failed SQL and recover deliberately.
 
 ## Development
 
